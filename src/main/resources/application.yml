@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: docx-to-xml-service
+  datasource:
+    url: jdbc:sqlserver://docprod\sqlprod:1433;databaseName=GAZ;encrypt=true;trustServerCertificate=true
+    username: DVSQL
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 10
+  task:
+    scheduling:
+      pool:
+        size: 2
+app:
+  poll-interval-ms: 5000        # период опроса очереди
+  ingest-interval-ms: 30000     # период поиска новых файлов в таблицах Directum
+  batch-size: 5                 # сколько задач захватывать за раз
+  worker-threads: 4             # лёгкий пул (обычные файлы)
+  heavy-threads: 1              # тяжёлый пул (огромные файлы, чтобы не съели память)
+  heavy-threshold-mb: 10        # граница "лёгкий/тяжёлый" в МБ
+  stale-timeout-sec: 900        # "зависшая" PROCESSING-задача считается потерянной
+  max-retries: 3                # максимум повторов ERROR-задачи
+  retry-delay-sec: 60           # пауза перед повтором ошибочной задачи
+logging:
+  file:
+    name: C:/svc/docx-processor/logs/application.log
+  level:
+    ru.example.docxservice: INFO
