@@ -1,4 +1,4 @@
-package infra;
+package kvo.convertXML.infra;
 
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -33,6 +33,10 @@ public class DocumentTaskDao {
           AND NOT EXISTS (SELECT 1
                           FROM dbo.doc_documents d
                           WHERE d.file_id = files.FileID)
+          AND (
+              CHARINDEX('.', REVERSE(files.Name)) > 0\s
+              AND RIGHT(files.Name, CHARINDEX('.', REVERSE(files.Name)) - 1) IN ('docx', 'Docx', 'DOCX', 'pdf')
+          )
         """;
 
     private static final String SQL_CLAIM_BATCH = """
@@ -101,7 +105,7 @@ public class DocumentTaskDao {
     }
 
     /**
-     * Ингест: добавление новых задач из действующих таблиц Directum.
+     * Ингест: добавление новых задач из действующих таблиц DocsVision.
      * Идемпотентно: NOT EXISTS + уникальный индекс по file_id.
      */
     public int ingestNewTasks() {

@@ -1,4 +1,4 @@
-package parser;
+package kvo.convertXML.parser;
 
 import jakarta.xml.bind.JAXBContext;
 import jakarta.xml.bind.JAXBException;
@@ -7,8 +7,8 @@ import org.apache.poi.xwpf.usermodel.*;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTcPr;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STMerge;
 import org.springframework.stereotype.Component;
-import parser.model.DocumentXml;
-import parser.model.*;
+import kvo.convertXML.parser.model.DocumentXml;
+import kvo.convertXML.parser.model.*;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -22,7 +22,12 @@ public class DocxToXmlParser {
     static {
         try {
             JAXB_CTX = JAXBContext.newInstance(
-                    DocumentXml.class, ParagraphXml.class, TableXml.class);
+                    DocumentXml.class,
+                    ParagraphXml.class,
+                    RunXml.class,
+                    TableXml.class,
+                    TableRowXml.class,
+                    TableCellXml.class);
         } catch (JAXBException e) {
             throw new IllegalStateException("JAXB init failed", e);
         }

@@ -1,4 +1,4 @@
-package processing;
+package kvo.convertXML.processing;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -8,8 +8,8 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Component;
-import infra.DocumentTaskDao;
-import infra.InstanceId;
+import kvo.convertXML.infra.DocumentTaskDao;
+import kvo.convertXML.infra.InstanceId;
 import java.util.List;
 
 @Component
@@ -40,7 +40,7 @@ public class DocumentPoller {
         this.maxRetries = maxRetries;
         this.retryDelaySec = retryDelaySec;
     }
-    /** Ингест: перенос новых файлов из таблиц Directum в очередь (только чтение источников). */
+    /** Ингест: перенос новых файлов из таблиц DocsVision в очередь (только чтение источников). */
     @Scheduled(fixedDelayString = "${app.ingest-interval-ms:30000}")
     public void ingest() {
         try {

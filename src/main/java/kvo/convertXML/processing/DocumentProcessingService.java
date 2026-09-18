@@ -1,15 +1,16 @@
-package processing;
+package kvo.convertXML.processing;
 
+import kvo.convertXML.parser.ParserDispatcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
-import infra.DocumentTaskDao;
-import infra.DocumentTaskDao.TaskHeader;
-import infra.InstanceId;
-import parser.DocxToXmlParser;
+import kvo.convertXML.infra.DocumentTaskDao;
+import kvo.convertXML.infra.DocumentTaskDao.TaskHeader;
+import kvo.convertXML.infra.InstanceId;
+import kvo.convertXML.parser.DocxToXmlParser;
 
 @Service
 public class DocumentProcessingService {
@@ -17,13 +18,13 @@ public class DocumentProcessingService {
     private static final Logger log = LoggerFactory.getLogger(DocumentProcessingService.class);
 
     private final DocumentTaskDao dao;
-    private final DocxToXmlParser parser;
+    private final ParserDispatcher parser;
     private final InstanceId instanceId;
     private final ThreadPoolTaskExecutor heavyWorkers;
     private final long heavyThresholdBytes;
 
     public DocumentProcessingService(DocumentTaskDao dao,
-                                     DocxToXmlParser parser,
+                                     ParserDispatcher parser,
                                      InstanceId instanceId,
                                      @Qualifier("docHeavyWorkers") ThreadPoolTaskExecutor heavyWorkers,
                                      @Value("${app.heavy-threshold-mb:10}") int heavyThresholdMb) {

@@ -2,7 +2,7 @@ spring:
   application:
     name: docx-to-xml-service
   datasource:
-    url: jdbc:sqlserver://docprod\sqlprod:1433;databaseName=GAZ;encrypt=true;trustServerCertificate=true
+    url: jdbc:sqlserver://docprod\\sqlprod:1433;databaseName=GAZ;encrypt=true;trustServerCertificate=true
     username: DVSQL
     password: ${DB_PASSWORD}
     hikari:
@@ -13,10 +13,10 @@ spring:
         size: 2
 app:
   poll-interval-ms: 5000        # период опроса очереди
-  ingest-interval-ms: 30000     # период поиска новых файлов в таблицах Directum
-  batch-size: 5                 # сколько задач захватывать за раз
-  worker-threads: 4             # лёгкий пул (обычные файлы)
-  heavy-threads: 1              # тяжёлый пул (огромные файлы, чтобы не съели память)
+  ingest-interval-ms: 30000     # период поиска новых файлов в таблицах DocsVision
+  batch-size: 500                # сколько задач захватывать за раз default - 5
+  worker-threads: 400             # лёгкий пул (обычные файлы) default - 4
+  heavy-threads: 50              # тяжёлый пул (огромные файлы, чтобы не съели память) default - 1
   heavy-threshold-mb: 10        # граница "лёгкий/тяжёлый" в МБ
   stale-timeout-sec: 900        # "зависшая" PROCESSING-задача считается потерянной
   max-retries: 3                # максимум повторов ERROR-задачи
@@ -25,4 +25,4 @@ logging:
   file:
     name: C:/svc/docx-processor/logs/application.log
   level:
-    ru.example.docxservice: INFO
+    kvo.convertXML: INFO
