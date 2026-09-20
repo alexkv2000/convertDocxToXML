@@ -1,6 +1,8 @@
 package kvo.convertXML.parser;
 
 import org.springframework.stereotype.Component;
+
+import java.nio.file.Path;
 import java.util.Locale;
 @Component
 public class ParserDispatcher {
@@ -10,7 +12,7 @@ public class ParserDispatcher {
         this.docxParser = docxParser;
         this.pdfParser = pdfParser;
     }
-    public byte[] parseToXml(String fileName, byte[] bytes) {
+    public Path parseToXml(String fileName, byte[] bytes) {
         return switch (extensionOf(fileName)) {
             case "docx" -> docxParser.parseToXml(fileName, bytes);
             case "pdf"  -> pdfParser.parseToXml(fileName, bytes);

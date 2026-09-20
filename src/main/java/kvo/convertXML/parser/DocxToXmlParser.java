@@ -12,6 +12,11 @@ import kvo.convertXML.parser.model.*;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 
 @Component
@@ -33,7 +38,8 @@ public class DocxToXmlParser {
         }
     }
 
-    public byte[] parseToXml(String fileName, byte[] docxBytes) {
+    public Path parseToXml(String fileName, byte[] docxBytes) {
+        Path tmp = null;
         try (XWPFDocument doc = new XWPFDocument(new ByteArrayInputStream(docxBytes))) {
             DocumentXml result = new DocumentXml();
             result.fileName = fileName;
@@ -46,11 +52,27 @@ public class DocxToXmlParser {
                     result.body.add(toTableXml(t));
                 }
             }
-            return marshal(result);
+            tmp = Files.createTempFile("docxml-", ".xml");
+            try (OutputStream os = Files.newOutputStream(tmp,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE)) {
+                marshal(result, os);          // JAXB пишет потоком на диск
+            }
+            return tmp;
         } catch (Exception e) {
+            if (tmp != null) {
+                try { Files.deleteIfExists(tmp); } catch (IOException ignored) { }
+            }
             throw new IllegalStateException(
                     "Не удалось разобрать docx: " + fileName + " — " + e.getMessage(), e);
         }
+    }
+
+    private void marshal(DocumentXml doc, OutputStream os) throws JAXBException {
+        Marshaller m = JAXB_CTX.createMarshaller();
+        m.setProperty(Marshaller.JAXB_FORMATTED_OUTPUT, Boolean.TRUE);
+        m.setProperty(Marshaller.JAXB_ENCODING, "UTF-8");
+        m.marshal(doc, os);
     }
 
     private ParagraphXml toParagraphXml(XWPFParagraph p) {
@@ -117,12 +139,4 @@ public class DocxToXmlParser {
         return (v == null) ? "continue" : v.toString();
     }
 
-    private byte[] marshal(DocumentXml doc) throws JAXBException {
-        Marshaller m = JAXB_CTX.createMarshaller();
-        m.setProperty(Marshaller.JAXB_FORMATTED_OUTPUT, Boolean.TRUE);
-        m.setProperty(Marshaller.JAXB_ENCODING, "UTF-8");
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        m.marshal(doc, out);
-        return out.toByteArray();
-    }
 }

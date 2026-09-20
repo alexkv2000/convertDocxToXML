@@ -4,8 +4,12 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.SQLException;
+import java.util.Collections;
 import java.util.List;
-import java.util.Optional;
 
 @Repository
 public class DocumentTaskDao {
@@ -54,17 +58,13 @@ public class DocumentTaskDao {
                AND d.updated_at < DATEADD(SECOND, -?, SYSUTCDATETIME()))
         """;
 
-    private static final String SQL_HEADER_BY_OWNER = """
-        SELECT d.id, d.file_id, d.file_name
-        FROM dbo.doc_documents d
-        WHERE d.id = ? AND d.locked_by = ?
-        """;
-
-    private static final String SQL_BINARY_SIZE = """
-        SELECT ISNULL(DATALENGTH(b.Data), 0)
-        FROM dbo.dvsys_files f WITH (NOLOCK)
+    private static final String SQL_HEADERS_BATCH = """
+        SELECT d.id, d.file_id, d.file_name,
+               ISNULL(DATALENGTH(b.Data), 0) AS size_bytes
+        FROM dbo.doc_documents d WITH (NOLOCK)
+             INNER JOIN dbo.dvsys_files f WITH (NOLOCK) ON f.FileID = d.file_id
              INNER JOIN dbo.dvsys_binaries b WITH (NOLOCK) ON b.ID = f.BinaryID
-        WHERE f.FileID = ?
+        WHERE d.id IN (%s)
         """;
 
     private static final String SQL_LOAD_BINARY = """
@@ -122,22 +122,20 @@ public class DocumentTaskDao {
                 batchSize, instanceId, staleTimeoutSec, maxRetries, retryDelaySec);
     }
 
-    public record TaskHeader(long id, String fileId, String fileName) {}
+    public record TaskHeader(long id, String fileId, String fileName, long sizeBytes) {}
 
-    /** Заголовок задачи без бинарника. WHERE locked_by — проверка владения. */
-    public Optional<TaskHeader> findHeaderByIdAndOwner(long id, String instanceId) {
-        List<TaskHeader> rows = jdbc.query(SQL_HEADER_BY_OWNER,
+    /** Заголовки + размеры бинарников захваченных задач ОДНИМ запросом на партию. */
+    public List<TaskHeader> headersFor(List<Long> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(",", Collections.nCopies(ids.size(), "?"));
+        return jdbc.query(String.format(SQL_HEADERS_BATCH, placeholders),
                 (rs, i) -> new TaskHeader(rs.getLong("id"),
                         rs.getString("file_id"),
-                        rs.getString("file_name")),
-                id, instanceId);
-        return rows.stream().findFirst();
-    }
-
-    /** Размер файла БЕЗ загрузки данных — для маршрутизации лёгкий/тяжёлый пул. */
-    public long binarySize(String fileId) {
-        Long size = jdbc.queryForObject(SQL_BINARY_SIZE, Long.class, fileId);
-        return size == null ? 0 : size;
+                        rs.getString("file_name"),
+                        rs.getLong("size_bytes")),
+                ids.toArray());
     }
 
     /** Загрузка бинарника напрямую из действующих таблиц (только чтение). */
@@ -149,13 +147,22 @@ public class DocumentTaskDao {
      * Фиксация результата в ОДНОЙ транзакции: статус DONE в очереди +
      * строка в doc_results. WHERE locked_by = ? — fencing.
      */
-    public boolean markDone(long id, String instanceId, byte[] xml) {
+    public boolean markDone(long id, String instanceId, Path xmlFile) throws IOException {
+        long xmlSize = Files.size(xmlFile);
         Boolean ok = tx.execute(status -> {
             int updated = jdbc.update(SQL_DONE_RELEASE, id, instanceId);
             if (updated == 0) {
                 return false; // владение потеряно — результат отбрасываем
             }
-            jdbc.update(SQL_DONE_INSERT_RESULT, xml, instanceId, id);
+            jdbc.update(SQL_DONE_INSERT_RESULT, ps -> {
+                try {
+                    ps.setBinaryStream(1, Files.newInputStream(xmlFile), xmlSize);
+                } catch (IOException e) {
+                    throw new SQLException("Не удалось открыть xml-файл результата", e);
+                }
+                ps.setString(2, instanceId);
+                ps.setLong(3, id);
+            });
             return true;
         });
         return Boolean.TRUE.equals(ok);
@@ -165,5 +172,20 @@ public class DocumentTaskDao {
     public boolean markFailed(long id, String instanceId, String error) {
         String msg = error.length() > 2000 ? error.substring(0, 2000) : error;
         return jdbc.update(SQL_MARK_FAILED, msg, id, instanceId) > 0;
+    }
+    private static final String SQL_FAIL_MISSING = """
+    UPDATE dbo.doc_documents
+       SET status = 3,
+           error_message = N'Исходный файл недоступен (удалён из DocsVision)',
+           retry_count = retry_count + 1,
+           locked_by = NULL,
+           locked_at = NULL,
+           updated_at = SYSUTCDATETIME()
+     WHERE id = ? AND locked_by = ?
+    """;
+    public void failMissing(String instanceId, List<Long> ids) {
+        if (ids.isEmpty()) return;
+        jdbc.batchUpdate(SQL_FAIL_MISSING,
+                ids.stream().map(id -> new Object[]{id, instanceId}).toList());
     }
 }

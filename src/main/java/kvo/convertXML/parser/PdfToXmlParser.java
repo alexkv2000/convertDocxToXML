@@ -4,19 +4,24 @@ import jakarta.xml.bind.JAXBContext;
 import jakarta.xml.bind.JAXBException;
 import jakarta.xml.bind.Marshaller;
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.io.IOUtils;
+import org.apache.pdfbox.io.RandomAccessReadBuffer;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.TextPosition;
 import org.springframework.stereotype.Component;
 import kvo.convertXML.parser.model.*;
-import java.io.ByteArrayOutputStream;
+//import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Objects;
 import java.util.regex.Pattern;
 @Component
 public class PdfToXmlParser {
@@ -35,8 +40,11 @@ public class PdfToXmlParser {
     /** Маркеры списков: тире, точки-буллеты, "1.", "1)", "а)". */
     private static final Pattern BULLET = Pattern.compile(
             "^\\s*([•●▪◦\\-*–—]|\\d{1,3}[.)]|[A-Za-zА-Яа-яЁё][.)])\\s+");
-    public byte[] parseToXml(String fileName, byte[] pdfBytes) {
-        try (PDDocument doc = Loader.loadPDF(pdfBytes)) {
+
+    public Path parseToXml(String fileName, byte[] pdfBytes) {
+        Path tmp = null;
+        try (PDDocument doc = Loader.loadPDF(new RandomAccessReadBuffer(pdfBytes),
+                IOUtils.createTempFileOnlyStreamCache())) {
             List<PdfLine> lines = new LineCollector().extract(doc);
             DocumentXml result = new DocumentXml();
             result.fileName = fileName;
@@ -55,12 +63,53 @@ public class PdfToXmlParser {
                 appendRuns(current, line, joinTight);
                 prev = line;
             }
-            return marshal(result);
+            tmp = Files.createTempFile("docxml-", ".xml");
+            try (OutputStream os = Files.newOutputStream(tmp,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE)) {
+                marshal(result, os);          // JAXB пишет потоком на диск
+            }
+            return tmp;
         } catch (Exception e) {
+            if (tmp != null) {
+                try { Files.deleteIfExists(tmp); } catch (IOException ignored) { }
+            }
             throw new IllegalStateException(
                     "Не удалось разобрать pdf: " + fileName + " — " + e.getMessage(), e);
         }
     }
+    private void marshal(DocumentXml doc, OutputStream os) throws JAXBException {
+        Marshaller m = JAXB_CTX.createMarshaller();
+        m.setProperty(Marshaller.JAXB_FORMATTED_OUTPUT, Boolean.TRUE);
+        m.setProperty(Marshaller.JAXB_ENCODING, "UTF-8");
+        m.marshal(doc, os);
+    }
+//    public byte[] parseToXml(String fileName, byte[] pdfBytes) {
+//        try (PDDocument doc = Loader.loadPDF(pdfBytes)) {
+//            List<PdfLine> lines = new LineCollector().extract(doc);
+//            DocumentXml result = new DocumentXml();
+//            result.fileName = fileName;
+//            result.processedAt = Instant.now().toString();
+//            ParagraphXml current = null;
+//            PdfLine prev = null;
+//            for (PdfLine line : lines) {
+//                boolean newParagraph = current == null
+//                        || startsWithBullet(line)
+//                        || isParagraphBreak(prev, line);
+//                if (newParagraph) {
+//                    current = new ParagraphXml();
+//                    result.body.add(current);
+//                }
+//                boolean joinTight = !newParagraph && resolveHyphenation(current);
+//                appendRuns(current, line, joinTight);
+//                prev = line;
+//            }
+//            return marshal(result);
+//        } catch (Exception e) {
+//            throw new IllegalStateException(
+//                    "Не удалось разобрать pdf: " + fileName + " — " + e.getMessage(), e);
+//        }
+//    }
     // ---- склейка строк в абзацы ----
     private boolean isParagraphBreak(PdfLine prev, PdfLine line) {
         if (prev == null || prev.page != line.page) {
@@ -173,12 +222,12 @@ public class PdfToXmlParser {
         String name = pos.getFont() != null ? pos.getFont().getName() : null;
         return name != null && name.toLowerCase(Locale.ROOT).contains(marker);
     }
-    private byte[] marshal(DocumentXml doc) throws JAXBException {
-        Marshaller m = JAXB_CTX.createMarshaller();
-        m.setProperty(Marshaller.JAXB_FORMATTED_OUTPUT, Boolean.TRUE);
-        m.setProperty(Marshaller.JAXB_ENCODING, "UTF-8");
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        m.marshal(doc, out);
-        return out.toByteArray();
-    }
+//    private byte[] marshal(DocumentXml doc) throws JAXBException {
+//        Marshaller m = JAXB_CTX.createMarshaller();
+//        m.setProperty(Marshaller.JAXB_FORMATTED_OUTPUT, Boolean.TRUE);
+//        m.setProperty(Marshaller.JAXB_ENCODING, "UTF-8");
+//        ByteArrayOutputStream out = new ByteArrayOutputStream();
+//        m.marshal(doc, out);
+//        return out.toByteArray();
+//    }
 }

@@ -2,27 +2,40 @@ spring:
   application:
     name: docx-to-xml-service
   datasource:
-    url: jdbc:sqlserver://docprod\\sqlprod:1433;databaseName=GAZ;encrypt=true;trustServerCertificate=true
+    url: jdbc:sqlserver://docprod\\sqlprod:1433;databaseName=GAZ;encrypt=true;trustServerCertificate=true;packetSize=32767
     username: DVSQL
     password: ${DB_PASSWORD}
     hikari:
-      maximum-pool-size: 10
+      maximum-pool-size: 24 # ФОРМУЛА: worker-threads + heavy-threads + 4 (поллер, ингест, резерв)
+      leak-detection-threshold: 0 # 60000
+      minimum-idle: 24
+
   task:
     scheduling:
       pool:
         size: 2
 app:
-  poll-interval-ms: 5000        # период опроса очереди
+  poll-interval-ms: 5000        # период опроса очереди - было 5000
   ingest-interval-ms: 30000     # период поиска новых файлов в таблицах DocsVision
-  batch-size: 500                # сколько задач захватывать за раз default - 5
-  worker-threads: 400             # лёгкий пул (обычные файлы) default - 4
-  heavy-threads: 50              # тяжёлый пул (огромные файлы, чтобы не съели память) default - 1
+  batch-size: 16                # сколько задач захватывать за раз default - 5
+  #worker-threads: 16             # лёгкий пул (обычные файлы) default - 4
+  #heavy-threads: 2              # тяжёлый пул (огромные файлы, чтобы не съели память) default - 1
   heavy-threshold-mb: 10        # граница "лёгкий/тяжёлый" в МБ
   stale-timeout-sec: 900        # "зависшая" PROCESSING-задача считается потерянной
   max-retries: 3                # максимум повторов ERROR-задачи
   retry-delay-sec: 60           # пауза перед повтором ошибочной задачи
+  exec:
+    light:
+      core: 4                  # лёгкий пул (обычные файлы) default - 4
+      max: 4
+      queue: 0
+    heavy:
+      core: 1                   # тяжёлый пул (огромные файлы, чтобы не съели память) default - 1
+      max: 1
+      queue: 500
 logging:
   file:
     name: C:/svc/docx-processor/logs/application.log
   level:
     kvo.convertXML: INFO
+    org.apache.pdfbox: ERROR
