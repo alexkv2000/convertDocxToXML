@@ -1,4 +1,4 @@
-package kvo.convertXML.parser.model;
+package kvo.convertxml.parser.model;
 
 import jakarta.xml.bind.annotation.*;
 import java.util.ArrayList;

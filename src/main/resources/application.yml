@@ -15,6 +15,7 @@ spring:
       pool:
         size: 2
 app:
+  ingest-lookback-days: 14      # Выборка данных из DocsVision (период)
   poll-interval-ms: 5000        # период опроса очереди - было 5000
   ingest-interval-ms: 30000     # период поиска новых файлов в таблицах DocsVision
   batch-size: 16                # сколько задач захватывать за раз default - 5
@@ -39,3 +40,4 @@ logging:
   level:
     kvo.convertXML: INFO
     org.apache.pdfbox: ERROR
+    org.apache.poi.hwpf: ERROR  # отключить на Прод

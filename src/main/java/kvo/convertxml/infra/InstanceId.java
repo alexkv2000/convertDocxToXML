@@ -1,4 +1,4 @@
-package kvo.convertXML.infra;
+package kvo.convertxml.infra;
 
 import org.springframework.stereotype.Component;
 

@@ -1,4 +1,4 @@
-package kvo.convertXML.parser;
+package kvo.convertxml.parser;
 
 import jakarta.xml.bind.JAXBContext;
 import jakarta.xml.bind.JAXBException;
@@ -11,7 +11,7 @@ import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.TextPosition;
 import org.springframework.stereotype.Component;
-import kvo.convertXML.parser.model.*;
+import kvo.convertxml.parser.model.*;
 //import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;

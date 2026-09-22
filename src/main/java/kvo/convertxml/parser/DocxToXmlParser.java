@@ -1,4 +1,4 @@
-package kvo.convertXML.parser;
+package kvo.convertxml.parser;
 
 import jakarta.xml.bind.JAXBContext;
 import jakarta.xml.bind.JAXBException;
@@ -7,11 +7,10 @@ import org.apache.poi.xwpf.usermodel.*;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTcPr;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STMerge;
 import org.springframework.stereotype.Component;
-import kvo.convertXML.parser.model.DocumentXml;
-import kvo.convertXML.parser.model.*;
+import kvo.convertxml.parser.model.DocumentXml;
+import kvo.convertxml.parser.model.*;
 
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Files;

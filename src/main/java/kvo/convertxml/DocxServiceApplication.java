@@ -1,4 +1,4 @@
-package kvo.convertXML;
+package kvo.convertxml;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;

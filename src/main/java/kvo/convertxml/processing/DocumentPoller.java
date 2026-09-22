@@ -1,4 +1,4 @@
-package kvo.convertXML.processing;
+package kvo.convertxml.processing;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -8,9 +8,9 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Component;
-import kvo.convertXML.infra.DocumentTaskDao;
-import kvo.convertXML.infra.DocumentTaskDao.TaskHeader;
-import kvo.convertXML.infra.InstanceId;
+import kvo.convertxml.infra.DocumentTaskDao;
+import kvo.convertxml.infra.DocumentTaskDao.TaskHeader;
+import kvo.convertxml.infra.InstanceId;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Semaphore;
@@ -29,7 +29,8 @@ public class DocumentPoller {
     private final int staleTimeoutSec;
     private final int maxRetries;
     private final int retryDelaySec;
-
+    @Value("${app.ingest-lookback-days:14}")
+    int ingestLookbackDays;
     /**
      * Слоты задач "в полёте", размер = числу потоков лёгкого пула.
      * Гарантирует: задач в работе не больше, чем потоков; workers.execute()
@@ -61,9 +62,13 @@ public class DocumentPoller {
     @Scheduled(fixedDelayString = "${app.ingest-interval-ms:30000}")
     public void ingest() {
         try {
-            int added = dao.ingestNewTasks();
+            long t0 = System.currentTimeMillis();
+            int added = dao.ingestNewTasks(ingestLookbackDays);
+            long ms = System.currentTimeMillis() - t0;
             if (added > 0) {
-                log.info("[{}] новых задач в очереди: {}", instanceId.get(), added);
+                log.info("[{}] новых задач в очереди: {} за {} мс", instanceId.get(), added, ms);
+            } else {
+                log.debug("[{}] ингест: 0 новых за {} мс", instanceId.get(), ms);
             }
         } catch (DuplicateKeyException e) {
             // гонка ингеста между инстансами: строки уже вставил другой — не ошибка

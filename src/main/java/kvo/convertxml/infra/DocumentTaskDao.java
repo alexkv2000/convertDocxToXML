@@ -1,4 +1,4 @@
-package kvo.convertXML.infra;
+package kvo.convertxml.infra;
 
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -15,32 +15,33 @@ import java.util.List;
 public class DocumentTaskDao {
 
     private static final String SQL_INGEST = """
-        INSERT INTO dbo.doc_documents (file_id, file_name)
-        SELECT files.FileID, files.Name
-        FROM dbo.[dvtable_{315cf3c8-1ee1-4f25-b843-e867345adb09}] link_cards WITH (NOLOCK)
-             INNER JOIN dbo.[dvtable_{30eb9b87-822b-4753-9a50-a1825dca1b74}] card_main_info WITH (NOLOCK)
-                    ON card_main_info.InstanceID = link_cards.DiadocCard
-             INNER JOIN dbo.[dvtable_{91b2c5f7-9324-4cef-9afe-a457c8310f06}] doc_sys WITH (NOLOCK)
-                    ON doc_sys.InstanceID = link_cards.DiadocCard
-             INNER JOIN dbo.[dvtable_{a6fa8baf-2ea4-4071-aa3e-5c4e71646a90}] doc_files WITH (NOLOCK)
-                    ON doc_files.InstanceID = card_main_info.InstanceID
-             INNER JOIN dbo.[dvtable_{f831372e-8a76-4abc-af15-d86dc5ffbe12}] v_files WITH (NOLOCK)
-                    ON v_files.InstanceID = doc_files.FileId
-             INNER JOIN dbo.dvsys_files files WITH (NOLOCK)
-                    ON files.FileID = v_files.FileID
-        WHERE doc_sys.Kind = 'FE65DE1F-14C7-4857-AC05-F9C3CC8D90C8'
-          AND card_main_info.CourtCaseUploaded = 0
-          AND files.Name NOT LIKE '%Печатная форма%'
-          AND files.Name NOT LIKE '%Архив передачи%'
-          -- если нужно парсить только docx, раскомментируйте:
-          -- AND files.Name LIKE '%.docx'
-          AND NOT EXISTS (SELECT 1
-                          FROM dbo.doc_documents d
-                          WHERE d.file_id = files.FileID)
-          AND (
-              CHARINDEX('.', REVERSE(files.Name)) > 0\s
-              AND RIGHT(files.Name, CHARINDEX('.', REVERSE(files.Name)) - 1) IN ('docx', 'Docx', 'DOCX', 'pdf')
-          )
+        
+            INSERT INTO dbo.doc_documents (file_id, file_name)
+            SELECT files.FileID, files.Name
+            FROM dbo.[dvtable_{315cf3c8-1ee1-4f25-b843-e867345adb09}] link_cards WITH (NOLOCK)
+                 INNER JOIN dbo.[dvtable_{30eb9b87-822b-4753-9a50-a1825dca1b74}] card_main_info WITH (NOLOCK)
+                      ON card_main_info.InstanceID = link_cards.DiadocCard
+                 INNER JOIN dbo.[dvtable_{91b2c5f7-9324-4cef-9afe-a457c8310f06}] doc_sys WITH (NOLOCK)
+                      ON doc_sys.InstanceID = link_cards.DiadocCard
+                 INNER JOIN dbo.[dvtable_{a6fa8baf-2ea4-4071-aa3e-5c4e71646a90}] doc_files WITH (NOLOCK)
+                      ON doc_files.InstanceID = card_main_info.InstanceID
+                 INNER JOIN dbo.[dvtable_{f831372e-8a76-4abc-af15-d86dc5ffbe12}] v_files WITH (NOLOCK)
+                      ON v_files.InstanceID = doc_files.FileId
+                 INNER JOIN dbo.dvsys_files files WITH (NOLOCK)
+                      ON files.FileID = v_files.FileID
+                 WHERE doc_sys.Kind = 'FE65DE1F-14C7-4857-AC05-F9C3CC8D90C8'
+                      AND card_main_info.CourtCaseUploaded = 0
+                      AND card_main_info.CreationDate >= DATEADD(DAY, -?, GETDATE())
+                      AND files.Name NOT LIKE '%Печатная форма%'
+                      AND files.Name NOT LIKE '%Архив передачи%'
+                      AND NOT EXISTS (SELECT 1
+                            FROM dbo.doc_documents d
+                            WHERE d.file_id = files.FileID
+                              AND d.created_at >= DATEADD(DAY, -?, SYSUTCDATETIME()))
+                      AND (
+                         CHARINDEX('.', REVERSE(files.Name)) > 0
+                         AND LOWER(RIGHT(files.Name, CHARINDEX('.', REVERSE(files.Name)) - 1)) IN ('doc', 'docx', 'pdf')
+                      )
         """;
 
     private static final String SQL_CLAIM_BATCH = """
@@ -108,8 +109,8 @@ public class DocumentTaskDao {
      * Ингест: добавление новых задач из действующих таблиц DocsVision.
      * Идемпотентно: NOT EXISTS + уникальный индекс по file_id.
      */
-    public int ingestNewTasks() {
-        return jdbc.update(SQL_INGEST);
+    public int ingestNewTasks(int lookbackDays) {
+        return jdbc.update(SQL_INGEST, lookbackDays, lookbackDays);
     }
 
     /**

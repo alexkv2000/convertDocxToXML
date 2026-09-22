@@ -1,9 +1,9 @@
-package kvo.convertXML.processing;
+package kvo.convertxml.processing;
 
-import kvo.convertXML.infra.DocumentTaskDao;
-import kvo.convertXML.infra.DocumentTaskDao.TaskHeader;
-import kvo.convertXML.infra.InstanceId;
-import kvo.convertXML.parser.ParserDispatcher;
+import kvo.convertxml.infra.DocumentTaskDao;
+import kvo.convertxml.infra.DocumentTaskDao.TaskHeader;
+import kvo.convertxml.infra.InstanceId;
+import kvo.convertxml.parser.ParserDispatcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
