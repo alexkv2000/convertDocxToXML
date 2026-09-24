@@ -15,6 +15,7 @@ spring:
       pool:
         size: 2
 app:
+  min-length-xml: 20            # минимальная длина xml успешного результата
   ingest-lookback-days: 14      # Выборка данных из DocsVision (период)
   poll-interval-ms: 5000        # период опроса очереди - было 5000
   ingest-interval-ms: 30000     # период поиска новых файлов в таблицах DocsVision
@@ -23,7 +24,7 @@ app:
   #heavy-threads: 2              # тяжёлый пул (огромные файлы, чтобы не съели память) default - 1
   heavy-threshold-mb: 10        # граница "лёгкий/тяжёлый" в МБ
   stale-timeout-sec: 900        # "зависшая" PROCESSING-задача считается потерянной
-  max-retries: 3                # максимум повторов ERROR-задачи
+  max-retries: 1                # максимум повторов ERROR-задачи
   retry-delay-sec: 60           # пауза перед повтором ошибочной задачи
   exec:
     light:
@@ -34,6 +35,16 @@ app:
       core: 1                   # тяжёлый пул (огромные файлы, чтобы не съели память) default - 1
       max: 1
       queue: 500
+iman:
+  enabled: true
+  base-url: https://iman.ai.loodsen.ru
+  agent: example_react
+  access-token: ${IMAN_ACCESS_TOKEN}   # не хранить токен в git
+  connect-timeout: 10s
+  read-timeout: 5m
+  max-text-chars: 100000
+  max-attempts: 3      # попыток на задачу
+  retry-backoff: 2s    # пауза 2с, 4с перед повторами
 logging:
   file:
     name: C:/svc/docx-processor/logs/application.log
