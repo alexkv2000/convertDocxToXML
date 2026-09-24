@@ -20,12 +20,12 @@ app:
   poll-interval-ms: 5000        # период опроса очереди - было 5000
   ingest-interval-ms: 30000     # период поиска новых файлов в таблицах DocsVision
   batch-size: 16                # сколько задач захватывать за раз default - 5
-  #worker-threads: 16             # лёгкий пул (обычные файлы) default - 4
-  #heavy-threads: 2              # тяжёлый пул (огромные файлы, чтобы не съели память) default - 1
   heavy-threshold-mb: 10        # граница "лёгкий/тяжёлый" в МБ
   stale-timeout-sec: 900        # "зависшая" PROCESSING-задача считается потерянной
   max-retries: 1                # максимум повторов ERROR-задачи
   retry-delay-sec: 60           # пауза перед повтором ошибочной задачи
+  prompt : | 
+    Ты получаешь текст документа. Выполни шаги : 1. Выбери из текста названия всех юр. лиц (организация-автор и контрагенты), их ИНН и КПП, если присутствуют. 2. Определи Вид документа (классификация, принятая в системах ЭДО). 3. Заполни XML-структуру по шаблону ниже данными из текста; заполни все теги, если данных нет — оставь тег пустым. 4. Выведи мне ТОЛЬКО XML без стороннего текста и без markdown. Шаблон:<Document><Header><DocumentType></DocumentType><RelatedDocument></RelatedDocument><Date></Date><Number></Number><OrderDate></OrderDate><OrderNumber></OrderNumber><CopyNumber></CopyNumber><Summa></Summa><NDS></NDS><Currency></Currency></Header><Parties><Company><Country></Country><Name></Name><Role></Role><Address></Address><INN></INN><Phone></Phone><SignatoryCompany></SignatoryCompany></Company><Counterparties><Counterparty><Country></Country><Name></Name><Address></Address><INN></INN><Phones><Phone></Phone></Phones><SignatoryCounterparty></SignatoryCounterparty></Counterparty></Counterparties></Parties></Document> Текст документа
   exec:
     light:
       core: 4                  # лёгкий пул (обычные файлы) default - 4
@@ -41,9 +41,9 @@ iman:
   agent: example_react
   access-token: ${IMAN_ACCESS_TOKEN}   # не хранить токен в git
   connect-timeout: 10s
-  read-timeout: 5m
+  read-timeout: 3m  # было "5"
   max-text-chars: 100000
-  max-attempts: 3      # попыток на задачу
+  max-attempts: 2      # попыток на задачу, можно увеличит до "3"
   retry-backoff: 2s    # пауза 2с, 4с перед повторами
 logging:
   file:

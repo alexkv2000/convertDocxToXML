@@ -12,7 +12,6 @@ import java.util.List;
 public class DocumentTaskDao {
 
     private static final String SQL_INGEST = """
-            
                 INSERT INTO dbo.doc_documents (file_id, file_name)
                 SELECT files.FileID, files.Name
                 FROM dbo.[dvtable_{315cf3c8-1ee1-4f25-b843-e867345adb09}] link_cards WITH (NOLOCK)

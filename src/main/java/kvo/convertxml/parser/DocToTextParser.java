@@ -4,6 +4,8 @@ import org.apache.poi.EncryptedDocumentException;
 import org.apache.poi.hwpf.HWPFDocument;
 import org.apache.poi.hwpf.OldWordFileFormatException;
 import org.apache.poi.hwpf.usermodel.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.io.BufferedWriter;
@@ -16,6 +18,8 @@ import java.nio.file.StandardOpenOption;
 
 @Component
 public class DocToTextParser {
+
+    private static final Logger log = LoggerFactory.getLogger(DocToTextParser.class);
 
     static final char CELL_SEPARATOR = '\t';
 
@@ -35,9 +39,7 @@ public class DocToTextParser {
             throw new IllegalStateException(
                     "Не удалось разобрать doc: " + fileName + " — формат Word 6/95 не поддерживается", e);
         } catch (Exception e) {
-            if (tmp != null) {
-                try { Files.deleteIfExists(tmp); } catch (IOException ignored) { }
-            }
+            deleteQuietly(tmp);
             throw new IllegalStateException(
                     "Не удалось разобрать doc: " + fileName + " — " + e.getMessage(), e);
         }
@@ -52,47 +54,74 @@ public class DocToTextParser {
             if (p.isInTable() && tables.hasNext()) {
                 Table table = tables.next();
                 writeTable(out, table);
-                i++;                                        // текущий параграф покрыт таблицей
-                while (i < range.numParagraphs()
-                        && range.getParagraph(i).getStartOffset() < table.getEndOffset()) {
-                    i++;                                    // пропускаем остальные параграфы таблицы
-                }
+                i = indexAfterTable(range, table, i);
             } else {
-                String text = paragraphText(p);
-                if (!text.isBlank()) {                      // пустые абзацы не пишем
-                    out.write(text);
-                    out.newLine();
-                }
+                writeParagraph(out, p);
                 i++;
             }
         }
     }
-    private void writeTable(BufferedWriter out, Table table) throws IOException {
-        for (int r = 0; r < table.numRows(); r++) {
-            TableRow row = table.getRow(r);
-            StringBuilder sb = new StringBuilder();
-            boolean firstCell = true;
-            for (int c = 0; c < row.numCells(); c++) {
-                TableCell cell = row.getCell(c);
-                // хвост горизонтального объединения: контент живёт в первой ячейке
-                if (cell.isMerged() && !cell.isFirstMerged()) {
-                    continue;
-                }
-                while (c + 1 < row.numCells()
-                        && row.getCell(c + 1).isMerged()
-                        && !row.getCell(c + 1).isFirstMerged()) {
-                    c++;                                    // пропускаем накрытые grid-колонки
-                }
-                if (!firstCell) sb.append(CELL_SEPARATOR);
-                firstCell = false;
-                sb.append(cellText(cell));
-            }
-            if (sb.toString().isBlank()) {
-                continue;           // строка целиком из пустых ячеек — не пишем пустую строку
-            }
-            out.write(sb.toString());
+
+    /** Пустые абзацы не пишем. */
+    private void writeParagraph(BufferedWriter out, Paragraph p) throws IOException {
+        String text = paragraphText(p);
+        if (!text.isBlank()) {
+            out.write(text);
             out.newLine();
         }
+    }
+
+    /** Индекс первого параграфа за пределами таблицы: текущий параграф уже покрыт ею. */
+    private int indexAfterTable(Range range, Table table, int current) {
+        int i = current + 1;                            // текущий параграф покрыт таблицей
+        while (i < range.numParagraphs()
+                && range.getParagraph(i).getStartOffset() < table.getEndOffset()) {
+            i++;                                        // пропускаем остальные параграфы таблицы
+        }
+        return i;
+    }
+
+    private void writeTable(BufferedWriter out, Table table) throws IOException {
+        for (int r = 0; r < table.numRows(); r++) {
+            writeRow(out, table.getRow(r));
+        }
+    }
+
+    /** Строка целиком из пустых ячеек — не пишем пустую строку. */
+    private void writeRow(BufferedWriter out, TableRow row) throws IOException {
+        String line = rowText(row);
+        if (!line.isBlank()) {
+            out.write(line);
+            out.newLine();
+        }
+    }
+
+    private String rowText(TableRow row) {
+        StringBuilder sb = new StringBuilder();
+        boolean firstCell = true;
+        for (int c = 0; c < row.numCells(); c++) {
+            TableCell cell = row.getCell(c);
+            if (isMergeTail(cell)) {
+                continue;   // хвост объединения: контент живёт в первой ячейке
+            }
+            if (!firstCell) sb.append(CELL_SEPARATOR);
+            firstCell = false;
+            sb.append(cellText(cell));
+        }
+        return sb.toString();
+    }
+
+    /** Хвост горизонтального объединения: контент живёт в первой ячейке. */
+    private static boolean isMergeTail(TableCell cell) {
+        return cell.isMerged() && !cell.isFirstMerged();
+    }
+
+    /** Последняя grid-колонка, накрытая текущим горизонтальным объединением. */
+    private int lastColumnOfMerge(TableRow row, int c) {
+        while (c + 1 < row.numCells() && isMergeTail(row.getCell(c + 1))) {
+            c++;
+        }
+        return c;
     }
 
     private String paragraphText(Paragraph p) {
@@ -127,5 +156,16 @@ public class DocToTextParser {
                 .replaceAll("\u0013[^\u0014\u0015]*\u0014([^\u0015]*)\u0015", "$1") // поле: берём результат, код выбрасываем
                 .replaceAll("\u0013[^\u0015]*\u0015", "")                          // поле без результата
                 .replaceAll("[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]", ""); // 0x07=метка ячейки, 0x0D=конец абзаца и пр.
+    }
+
+    private void deleteQuietly(Path file) {
+        if (file == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(file);
+        } catch (IOException e) {
+            log.debug("Не удалось удалить временный файл {}", file, e);
+        }
     }
 }

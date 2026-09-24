@@ -7,6 +7,8 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.TextPosition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.io.BufferedWriter;
@@ -21,6 +23,8 @@ import java.util.regex.Pattern;
 
 @Component
 public class PdfToTextParser {
+
+    private static final Logger log = LoggerFactory.getLogger(PdfToTextParser.class);
 
     /** Абзац рвём, когда вертикальный промежуток между строками больше 1.3 высоты шрифта. */
     private static final float PARAGRAPH_GAP_FACTOR = 1.3f;
@@ -37,42 +41,61 @@ public class PdfToTextParser {
             try (BufferedWriter out = Files.newBufferedWriter(tmp, StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
                     StandardOpenOption.WRITE)) {
-                StringBuilder current = null;
-                PdfLine prev = null;
-                for (PdfLine line : lines) {
-                    String lineText = lineText(line);
-                    if (lineText.isEmpty()) {
-                        continue;
-                    }
-                    boolean newParagraph = current == null
-                            || BULLET.matcher(lineText).find()
-                            || isParagraphBreak(prev, line);
-                    if (newParagraph) {
-                        if (current != null) {
-                            out.write(current.toString());
-                            out.newLine();                          // <-- было '\n'
-                        }
-                        current = new StringBuilder(lineText);
-                    } else if (endsWithHyphen(current)) {
-                        current.setLength(current.length() - 1); // убираем дефис переноса
-                        current.append(lineText);
-                    } else {
-                        current.append(' ').append(lineText);
-                    }
-                    prev = line;
-                }
-                if (current != null) {
-                    out.write(current.toString());
-                    out.newLine();                                  // <-- было '\n'
-                }
+                writeParagraphs(lines, out);
             }
             return tmp;
         } catch (Exception e) {
-            if (tmp != null) {
-                try { Files.deleteIfExists(tmp); } catch (IOException ignored) { }
-            }
+            deleteQuietly(tmp);
             throw new IllegalStateException(
                     "Не удалось разобрать pdf: " + fileName + " — " + e.getMessage(), e);
+        }
+    }
+
+    /** Склеивает строки PDF в абзацы (маркеры списков, разрывы, дефисы переноса) и пишет их в out. */
+    private void writeParagraphs(List<PdfLine> lines, BufferedWriter out) throws IOException {
+        StringBuilder current = null;
+        PdfLine prev = null;
+        for (PdfLine line : lines) {
+            String lineText = lineText(line);
+            if (lineText.isEmpty()) {
+                continue;
+            }
+            if (isNewParagraph(current, lineText, prev, line)) {
+                flushParagraph(out, current);
+                current = new StringBuilder(lineText);
+            } else if (endsWithHyphen(current)) {
+                current.setLength(current.length() - 1); // убрать дефис переноса
+                current.append(lineText);
+            } else {
+                current.append(' ').append(lineText);
+            }
+            prev = line;
+        }
+        flushParagraph(out, current);
+    }
+
+    private boolean isNewParagraph(StringBuilder current, String lineText, PdfLine prev, PdfLine line) {
+        return current == null
+                || BULLET.matcher(lineText).find()
+                || isParagraphBreak(prev, line);
+    }
+
+    private void flushParagraph(BufferedWriter out, StringBuilder paragraph) throws IOException {
+        if (paragraph == null) {
+            return;
+        }
+        out.write(paragraph.toString());
+        out.newLine();
+    }
+
+    private void deleteQuietly(Path file) {
+        if (file == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(file);
+        } catch (IOException e) {
+            log.debug("Не удалось удалить временный файл {}", file, e);
         }
     }
 

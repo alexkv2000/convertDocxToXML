@@ -3,6 +3,7 @@ package kvo.convertxml.client;
 import kvo.convertxml.config.ImanProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
@@ -25,25 +26,30 @@ public class ImanDocumentEnricher {
 
     private static final Logger log = LoggerFactory.getLogger(ImanDocumentEnricher.class);
 
-    private static final String PROMPT = """
-            Ты получаешь текст документа. Выполни шаги:
-            1. Выбери из текста названия всех юр. лиц (организация-автор и контрагенты), их ИНН и КПП, если присутствуют.
-            2. Определи Вид документа (классификация, принятая в системах ЭДО).
-            3. Заполни XML-структуру по шаблону ниже данными из текста; заполни все теги, если данных нет — оставь тег пустым.
-            4. Выведи мне ТОЛЬКО XML без стороннего текста и без markdown.
+    // Имена полей A2A/JSON-RPC протокола iman — вынесены в константы, чтобы не дублировать литералы
+    private static final String KEY_PARTS = "parts";
+    private static final String KEY_TEXT = "text";
+    private static final String KEY_TYPE = "type";
+    private static final String KEY_KIND = "kind";
+    private static final String KEY_MESSAGE = "message";
+    private static final String KEY_STATUS = "status";
+    private static final String KEY_ERROR = "error";
 
-            Шаблон:
-            <Document><Header><DocumentType></DocumentType><RelatedDocument></RelatedDocument><Date></Date><Number></Number><OrderDate></OrderDate><OrderNumber></OrderNumber><CopyNumber></CopyNumber><Summa></Summa><NDS></NDS><Currency></Currency></Header><Parties><Company><Country></Country><Name></Name><Role></Role><Address></Address><INN></INN><Phone></Phone><SignatoryCompany></SignatoryCompany></Company><Counterparties><Counterparty><Country></Country><Name></Name><Address></Address><INN></INN><Phones><Phone></Phone></Phones><SignatoryCounterparty></SignatoryCounterparty></Counterparty></Counterparties></Parties></Document>
-
-            Текст документа:
-            """;
+    private static final String DOC_OPEN = "<Document>";
+    private static final String DOC_CLOSE = "</Document>";
 
     private final ImanProperties props;
+    private final String prompt;
     private final RestClient restClient;
     private final DocumentBuilderFactory dbf;
 
-    public ImanDocumentEnricher(ImanProperties props) {
+    public ImanDocumentEnricher(ImanProperties props,
+                                @Value("${app.prompt}") String prompt) {
+        if (prompt == null || prompt.isBlank()) {
+            throw new IllegalStateException("app.prompt не задан (application.yml) — промпт обязателен");
+        }
         this.props = props;
+        this.prompt = prompt;
         JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(
                 HttpClient.newBuilder().connectTimeout(props.connectTimeout()).build());
         factory.setReadTimeout(props.readTimeout());
@@ -98,7 +104,7 @@ public class ImanDocumentEnricher {
     private Map<String, Object> buildRequest(String documentText) {
         Map<String, Object> message = Map.of(
                 "role", "user",
-                "parts", List.of(Map.of("type", "text", "text", PROMPT + documentText)),
+                KEY_PARTS, List.of(Map.of(KEY_TYPE, KEY_TEXT, KEY_TEXT, prompt + documentText)),
                 "messageId", UUID.randomUUID().toString(),
                 "contextId", UUID.randomUUID().toString());
 
@@ -107,8 +113,8 @@ public class ImanDocumentEnricher {
                 "id", UUID.randomUUID().toString(),
                 "method", "message/send",
                 "params", Map.of(
-                        "message", message,
-                        "configuration", Map.of("acceptedOutputModes", List.of("text")),
+                        KEY_MESSAGE, message,
+                        "configuration", Map.of("acceptedOutputModes", List.of(KEY_TEXT)),
                         "skillId", "default"));
     }
 
@@ -116,45 +122,38 @@ public class ImanDocumentEnricher {
         if (response == null) {
             throw new ImanUnavailableException("iman: пустой ответ");
         }
-        if (response.has("error")) {
+        if (response.has(KEY_ERROR)) {
             throw new ImanUnavailableException("iman: jsonrpc error "
-                    + response.path("error").path("code").asInt() + ": "
-                    + response.path("error").path("message").asString(""));
+                    + response.path(KEY_ERROR).path("code").asInt() + ": "
+                    + response.path(KEY_ERROR).path(KEY_MESSAGE).asString(""));
         }
-
         JsonNode result = response.path("result");
-
-        String s = firstText(result.path("parts"));
+        String s = firstText(result.path(KEY_PARTS));
         if (s != null) return s;
-
-        s = firstText(result.path("status").path("message").path("parts"));
+        s = firstText(result.path(KEY_STATUS).path(KEY_MESSAGE).path(KEY_PARTS));
         if (s != null) return s;
-
         String fallback = null;
         StringBuilder names = new StringBuilder();
         for (JsonNode artifact : result.path("artifacts")) {
             String name = artifact.path("name").asString("");
             names.append(name).append(", ");
-            if ("reasoning".equalsIgnoreCase(name)) {
-                continue;
-            }
-            String text = firstText(artifact.path("parts"));
+            String text = "reasoning".equalsIgnoreCase(name)
+                    ? null                                   // «рассуждения» агента пропускаем
+                    : firstText(artifact.path(KEY_PARTS));
             if (text == null) {
                 continue;
             }
-            if (text.contains("<Document")) {
+            if (text.contains(DOC_OPEN)) {
                 return text;
             }
             if (fallback == null) {
                 fallback = text;
             }
         }
-
         if (fallback != null) {
             return fallback;
         }
-
-        String state = result.path("status").path("state").asString("");
+        String state = result.path(KEY_STATUS).path("state").asString("");
         throw new ImanUnavailableException("iman: нет текстовых parts (state=" + state
                 + ", artifacts=[" + names + "]): " + abbreviate(response.toString()));
     }
@@ -162,12 +161,12 @@ public class ImanDocumentEnricher {
     /** Первый непустой текстовый part; type или kind = "text". */
     private String firstText(JsonNode parts) {
         for (JsonNode part : parts) {
-            JsonNode text = part.path("text");
-            if (!text.isTextual() || text.asString().isBlank()) {
+            JsonNode text = part.path(KEY_TEXT);
+            if (!text.isString() || text.asString().isBlank()) {
                 continue;
             }
-            String kind = part.path("type").asString(part.path("kind").asString(""));
-            if (kind.isEmpty() || "text".equals(kind)) {
+            String kind = part.path(KEY_TYPE).asString(part.path(KEY_KIND).asString(""));
+            if (kind.isEmpty() || KEY_TEXT.equals(kind)) {
                 return text.asString();
             }
         }
@@ -177,13 +176,13 @@ public class ImanDocumentEnricher {
     /** Вырезает <Document>...</Document> из ответа агента (в т.ч. из markdown-заборов ```xml). */
     private String extractXml(String agentText) {
         String cleaned = agentText.replace("```xml", "").replace("```", "").trim();
-        int start = cleaned.indexOf("<Document>");
-        int end = cleaned.lastIndexOf("</Document>");
+        int start = cleaned.indexOf(DOC_OPEN);
+        int end = cleaned.lastIndexOf(DOC_CLOSE);
         if (start < 0 || end < start) {
             throw new ImanUnavailableException(
                     "iman: нет <Document>...</Document> в ответе: " + abbreviate(cleaned));
         }
-        return cleaned.substring(start, end + "</Document>".length());
+        return cleaned.substring(start, end + DOC_CLOSE.length());
     }
 
     private void validate(String xml) {
