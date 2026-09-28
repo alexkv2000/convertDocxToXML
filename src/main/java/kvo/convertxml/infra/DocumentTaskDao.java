@@ -1,6 +1,5 @@
 package kvo.convertxml.infra;
 
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -41,18 +40,28 @@ public class DocumentTaskDao {
             """;
 
     private static final String SQL_CLAIM_BATCH = """
-            UPDATE TOP (?) d
+            WITH picked AS (
+                SELECT TOP (?) id
+                FROM dbo.doc_documents WITH (UPDLOCK, ROWLOCK, READPAST)
+                WHERE status = 0
+                   OR (status = 1 AND locked_at IS NOT NULL
+                       AND locked_at < DATEADD(SECOND, -?, SYSUTCDATETIME()))
+                   OR (status = 3 AND retry_count < ?
+                       AND updated_at IS NOT NULL
+                       AND updated_at < DATEADD(SECOND, -?, SYSUTCDATETIME()))
+                ORDER BY CASE
+                             WHEN status = 1 THEN 0
+                             WHEN status = 0 THEN 1
+                             ELSE 2
+                         END, id
+            )
+            UPDATE d
                SET d.status    = 1,
                    d.locked_by = ?,
                    d.locked_at = SYSUTCDATETIME()
             OUTPUT INSERTED.id
-            FROM dbo.doc_documents AS d WITH (UPDLOCK, ROWLOCK, READPAST)
-            WHERE d.status = 0
-               OR (d.status = 1 AND d.locked_at IS NOT NULL
-                   AND d.locked_at < DATEADD(SECOND, -?, SYSUTCDATETIME()))
-               OR (d.status = 3 AND d.retry_count < ?
-                   AND d.updated_at IS NOT NULL
-                   AND d.updated_at < DATEADD(SECOND, -?, SYSUTCDATETIME()))
+            FROM dbo.doc_documents AS d
+            JOIN picked ON picked.id = d.id
             """;
 
     private static final String SQL_HEADERS_BATCH = """
@@ -84,7 +93,9 @@ public class DocumentTaskDao {
             FROM dbo.doc_documents
             WHERE id = ?
             """;
-
+    private static final String SQL_DONE_DELETE_RESULT = """ 
+            DELETE FROM dbo.doc_results WHERE doc_id = ?
+            """;
     private static final String SQL_MARK_FAILED = """
             UPDATE dbo.doc_documents
                SET status = 3, error_message = ?,
@@ -110,10 +121,14 @@ public class DocumentTaskDao {
         this.jdbc = jdbc;
         this.tx = tx;
     }
-    /** Пустой результат: ERROR без записи в doc_results. */
+
+    /**
+     * Пустой результат: ERROR без записи в doc_results.
+     */
     public boolean markEmptyResult(long id, String instanceId) {
         return jdbc.update(SQL_EMPTY_RESULT, id, instanceId) > 0;
     }
+
     /**
      * Ингест: добавление новых задач из действующих таблиц DocsVision.
      * Идемпотентно: NOT EXISTS + уникальный индекс по file_id.
@@ -129,7 +144,7 @@ public class DocumentTaskDao {
     public List<Long> claimBatch(String instanceId, int batchSize,
                                  int staleTimeoutSec, int maxRetries, int retryDelaySec) {
         return jdbc.queryForList(SQL_CLAIM_BATCH, Long.class,
-                batchSize, instanceId, staleTimeoutSec, maxRetries, retryDelaySec);
+                batchSize, staleTimeoutSec, maxRetries, retryDelaySec, instanceId);
     }
 
     public record TaskHeader(long id, String fileId, String fileName, long sizeBytes) {
@@ -168,6 +183,7 @@ public class DocumentTaskDao {
             if (updated == 0) {
                 return false; // владение потеряно — результат отбрасываем
             }
+            jdbc.update(SQL_DONE_DELETE_RESULT, id); // если результат есть в таблице - Удалить на ПРОДЕ!
             jdbc.update(SQL_DONE_INSERT_RESULT, text, instanceId, id);
             return true;
         });

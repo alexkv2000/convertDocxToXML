@@ -8,66 +8,96 @@ import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 import org.xml.sax.InputSource;
 import tools.jackson.databind.JsonNode;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.StringReader;
+import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 @Component
 public class ImanDocumentEnricher {
 
     private static final Logger log = LoggerFactory.getLogger(ImanDocumentEnricher.class);
-
-    // Имена полей A2A/JSON-RPC протокола iman — вынесены в константы, чтобы не дублировать литералы
-    private static final String KEY_PARTS = "parts";
-    private static final String KEY_TEXT = "text";
-    private static final String KEY_TYPE = "type";
-    private static final String KEY_KIND = "kind";
-    private static final String KEY_MESSAGE = "message";
-    private static final String KEY_STATUS = "status";
+    private final LlmAvailability llm;
+    private final RestClient pingClient;
+    // Имена полей OpenAI-совместимого /chat/completions
     private static final String KEY_ERROR = "error";
+    private static final String KEY_MESSAGE = "message";
+    private static final String KEY_CONTENT = "content";
+    private static final String KEY_CHOICES = "choices";
+    private static final String KEY_FINISH_REASON = "finish_reason";
 
     private static final String DOC_OPEN = "<Document>";
     private static final String DOC_CLOSE = "</Document>";
 
     private final ImanProperties props;
-    private final String prompt;
+    private final String prompt;                 // системная инструкция из app.prompt
     private final RestClient restClient;
     private final DocumentBuilderFactory dbf;
 
     public ImanDocumentEnricher(ImanProperties props,
+                                LlmAvailability llm,
                                 @Value("${app.prompt}") String prompt) {
         if (prompt == null || prompt.isBlank()) {
             throw new IllegalStateException("app.prompt не задан (application.yml) — промпт обязателен");
         }
         this.props = props;
+        this.llm = llm;
         this.prompt = prompt;
+        // HTTP/1.1: после GOAWAY от балансировщика HTTP/2-клиент JDK продолжал слать запросы
+        // в «мёртвое» мультиплексированное соединение — проба вечно висела на нём
+        // (Request cancelled каждые 60 с). На 1.1 соединения не мультиплексируются,
+        // мёртвое выкидывается, следующий запрос открывает новое.
         JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(
-                HttpClient.newBuilder().connectTimeout(props.connectTimeout()).build());
+                HttpClient.newBuilder()
+                        .version(HttpClient.Version.HTTP_1_1)
+                        .connectTimeout(props.connectTimeout())
+                        .build());
         factory.setReadTimeout(props.readTimeout());
         this.restClient = RestClient.builder()
-                .baseUrl(props.baseUrl() + "/agents/" + props.agent())
-                .defaultHeader("Authorization", "Bearer " + props.accessToken())
                 .requestFactory(factory)
+                .defaultHeader("Authorization", "Bearer " + props.accessToken())
+                .build();
+        JdkClientHttpRequestFactory pingFactory = new JdkClientHttpRequestFactory(
+                HttpClient.newBuilder()
+                        .version(HttpClient.Version.HTTP_1_1)
+                        .connectTimeout(Duration.ofSeconds(10))
+                        .build());
+        pingFactory.setReadTimeout(Duration.ofSeconds(30));
+        this.pingClient = RestClient.builder()
+                .requestFactory(pingFactory)
+                .defaultHeader("Authorization", "Bearer " + props.accessToken())
                 .build();
         this.dbf = newSecureDbf();
     }
 
-    /** Возвращает заполненную XML-шапку <Document>...</Document>. Транзитные сбои агента повторяем. */
+    public void ping() {
+        pingClient.post()
+                .uri(URI.create(props.baseUrl()))   // тот же полный адрес, что в attemptExtract
+                .contentType(MediaType.APPLICATION_JSON)
+                .accept(MediaType.APPLICATION_JSON)
+                .body(Map.of(
+                        "model", props.model(),
+                        "messages", List.of(Map.of("role", "user", KEY_CONTENT, "ping")),
+                        "max_tokens", 1))
+                .retrieve()
+                .toBodilessEntity();
+    }
+    /** Возвращает заполненную XML-шапку <Document>...</Document>. Транзитные сбои LLM повторяем. */
     public String extractHeader(String fullDocumentText) {
         for (int attempt = 1; attempt <= props.maxAttempts(); attempt++) {
             try {
                 return attemptExtract(fullDocumentText);
             } catch (ImanUnavailableException e) {
-                log.warn("iman: попытка {}/{} не удалась: {}",
+                log.warn("LLM: попытка {}/{} не удалась: {}",
                         attempt, props.maxAttempts(), e.getMessage());
                 if (attempt == props.maxAttempts()) {
                     throw e;
@@ -79,108 +109,117 @@ public class ImanDocumentEnricher {
     }
 
     private String attemptExtract(String fullDocumentText) {
+        if (llm.isPaused()) {
+            throw new ImanUnavailableException("LLM на паузе — отдаём задачу на повтор, не жжём таймаут");
+        }
         Map<String, Object> body = buildRequest(truncate(fullDocumentText));
-
         long started = System.currentTimeMillis();
-        JsonNode response = restClient.post()
-                .contentType(MediaType.APPLICATION_JSON)
-                .accept(MediaType.APPLICATION_JSON)
-                .body(body)
-                .retrieve()
-                .onStatus(HttpStatusCode::isError, (req, res) -> {
-                    String err = new String(res.getBody().readAllBytes(), StandardCharsets.UTF_8);
-                    throw new ImanUnavailableException(
-                            "iman HTTP " + res.getStatusCode() + ": " + abbreviate(err));
-                })
-                .body(JsonNode.class);
-        log.info("iman: ответ агента за {} мс", System.currentTimeMillis() - started);
-
-        String xml = extractXml(agentText(response));
+        JsonNode response;
+        try {
+            response = restClient.post()
+                    .uri(URI.create(props.baseUrl()))
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .accept(MediaType.APPLICATION_JSON)
+                    .body(body)
+                    .retrieve()
+                    .onStatus(HttpStatusCode::isError, (req, res) -> {
+                        // НОВОЕ: 5xx — провайдер лежит/перегружен, 4xx — эндпоинт жив
+                        if (res.getStatusCode().is5xxServerError()
+                                || res.getStatusCode().value() == 429) {
+                            llm.failure();
+                        }
+                        String err = new String(res.getBody().readAllBytes(), StandardCharsets.UTF_8);
+                        throw new ImanUnavailableException(
+                                "LLM HTTP " + res.getStatusCode() + ": " + abbreviate(err));
+                    })
+                    .body(JsonNode.class);
+        } catch (ResourceAccessException e) {        // НОВОЕ: таймаут/обрыв/DNS — не отвечает
+            llm.failure();
+            throw e;                                 // дальше — как раньше, на уровень задачи
+        }
+        llm.success();                              // НОВОЕ: HTTP 200 получен — эндпоинт жив
+        Completion c = parseCompletion(response);
+        log.info("LLM {}: ответ за {} мс, finish_reason={}, tokens prompt/completion: {}/{}",
+                props.model(), System.currentTimeMillis() - started,
+                c.finishReason(), c.promptTokens(), c.completionTokens());
+        if (c.completionTokens() * 5 >= props.maxTokens() * 4) {
+            log.warn("LLM: completion_tokens={} близок к max_tokens={} — риск обрезки ответа, "
+                            + "увеличьте iman.max-tokens или уменьшите iman.max-text-chars",
+                    c.completionTokens(), props.maxTokens());
+        }
+        String xml = extractXml(c.content());
         validate(xml);
         return xml;
     }
 
-    // id, messageId, contextId генерируются ЗАНОВО на каждый вызов (в т.ч. на каждый ретрай).
-    private Map<String, Object> buildRequest(String documentText) {
-        Map<String, Object> message = Map.of(
-                "role", "user",
-                KEY_PARTS, List.of(Map.of(KEY_TYPE, KEY_TEXT, KEY_TEXT, prompt + documentText)),
-                "messageId", UUID.randomUUID().toString(),
-                "contextId", UUID.randomUUID().toString());
-
-        return Map.of(
-                "jsonrpc", "2.0",
-                "id", UUID.randomUUID().toString(),
-                "method", "message/send",
-                "params", Map.of(
-                        KEY_MESSAGE, message,
-                        "configuration", Map.of("acceptedOutputModes", List.of(KEY_TEXT)),
-                        "skillId", "default"));
+    /** Разобранный ответ /chat/completions. */
+    private record Completion(String content, String finishReason,
+                              int promptTokens, int completionTokens) {
     }
-
-    private String agentText(JsonNode response) {
+    /** choices[0] + usage; content с fallback на reasoning_content для reasoning-моделей. */
+    private Completion parseCompletion(JsonNode response) {
         if (response == null) {
-            throw new ImanUnavailableException("iman: пустой ответ");
+            throw new ImanUnavailableException("LLM: пустой ответ");
         }
-        if (response.has(KEY_ERROR)) {
-            throw new ImanUnavailableException("iman: jsonrpc error "
-                    + response.path(KEY_ERROR).path("code").asInt() + ": "
-                    + response.path(KEY_ERROR).path(KEY_MESSAGE).asString(""));
+        JsonNode error = response.path(KEY_ERROR);
+        if (error.isObject()) {
+            throw new ImanUnavailableException("LLM error: "
+                    + error.path(KEY_MESSAGE).asString(""));
         }
-        JsonNode result = response.path("result");
-        String s = firstText(result.path(KEY_PARTS));
-        if (s != null) return s;
-        s = firstText(result.path(KEY_STATUS).path(KEY_MESSAGE).path(KEY_PARTS));
-        if (s != null) return s;
-        String fallback = null;
-        StringBuilder names = new StringBuilder();
-        for (JsonNode artifact : result.path("artifacts")) {
-            String name = artifact.path("name").asString("");
-            names.append(name).append(", ");
-            String text = "reasoning".equalsIgnoreCase(name)
-                    ? null                                   // «рассуждения» агента пропускаем
-                    : firstText(artifact.path(KEY_PARTS));
-            if (text == null) {
-                continue;
-            }
-            if (text.contains(DOC_OPEN)) {
-                return text;
-            }
-            if (fallback == null) {
-                fallback = text;
-            }
+        JsonNode choices = response.path(KEY_CHOICES);
+        if (!choices.isArray() || choices.isEmpty()) {
+            throw new ImanUnavailableException(
+                    "LLM: нет choices: " + abbreviate(response.toString()));
         }
-        if (fallback != null) {
-            return fallback;
+        JsonNode choice = choices.get(0);
+        String finishReason = choice.path(KEY_FINISH_REASON).asString("");
+        if ("length".equals(finishReason)) {
+            throw new ImanUnavailableException(
+                    "LLM: ответ обрезан по max_tokens=" + props.maxTokens()
+                            + " — увеличьте iman.max-tokens или уменьшите iman.max-text-chars");
         }
-        String state = result.path(KEY_STATUS).path("state").asString("");
-        throw new ImanUnavailableException("iman: нет текстовых parts (state=" + state
-                + ", artifacts=[" + names + "]): " + abbreviate(response.toString()));
+        if ("content_filter".equals(finishReason)) {
+            throw new ImanUnavailableException("LLM: ответ заблокирован контент-фильтром");
+        }
+        if (!finishReason.isEmpty() && !"stop".equals(finishReason) && !"eos".equals(finishReason)) {
+            // не ломаем обработку, но фиксируем нестандартное поведение бэкенда
+            log.warn("LLM: нестандартный finish_reason={} — проверьте ответ модели", finishReason);
+        }
+        JsonNode message = choice.path(KEY_MESSAGE);
+        String content = message.path(KEY_CONTENT).asString("");
+        if (content.isBlank()) {
+            content = message.path("reasoning_content").asString("");
+        }
+        if (content.isBlank()) {
+            throw new ImanUnavailableException(
+                    "LLM: пустой content (finish_reason=" + finishReason + ")");
+        }
+        return new Completion(content, finishReason,
+                response.path("usage").path("prompt_tokens").asInt(-1),
+                response.path("usage").path("completion_tokens").asInt(-1));
     }
 
-    /** Первый непустой текстовый part; type или kind = "text". */
-    private String firstText(JsonNode parts) {
-        for (JsonNode part : parts) {
-            JsonNode text = part.path(KEY_TEXT);
-            if (!text.isString() || text.asString().isBlank()) {
-                continue;
-            }
-            String kind = part.path(KEY_TYPE).asString(part.path(KEY_KIND).asString(""));
-            if (kind.isEmpty() || KEY_TEXT.equals(kind)) {
-                return text.asString();
-            }
-        }
-        return null;
+    /** OpenAI-совместимое тело запроса: system — инструкция, user — текст документа. */
+    private Map<String, Object> buildRequest(String documentText) {
+        return Map.of(
+                "model", props.model(),
+                "messages", List.of(
+                        Map.of("role", "system", KEY_CONTENT, prompt),
+                        Map.of("role", "user", KEY_CONTENT, documentText)),
+                "temperature", props.temperature(),
+                "max_tokens", props.maxTokens(),
+                "stream", false);
     }
 
-    /** Вырезает <Document>...</Document> из ответа агента (в т.ч. из markdown-заборов ```xml). */
+
+    /** Вырезает <Document>...</Document> из ответа модели (в т.ч. из markdown-заборов ```xml). */
     private String extractXml(String agentText) {
         String cleaned = agentText.replace("```xml", "").replace("```", "").trim();
         int start = cleaned.indexOf(DOC_OPEN);
         int end = cleaned.lastIndexOf(DOC_CLOSE);
         if (start < 0 || end < start) {
             throw new ImanUnavailableException(
-                    "iman: нет <Document>...</Document> в ответе: " + abbreviate(cleaned));
+                    "LLM: нет <Document>...</Document> в ответе: " + abbreviate(cleaned));
         }
         return cleaned.substring(start, end + DOC_CLOSE.length());
     }
@@ -189,7 +228,7 @@ public class ImanDocumentEnricher {
         try {
             dbf.newDocumentBuilder().parse(new InputSource(new StringReader(xml)));
         } catch (Exception e) {
-            throw new ImanUnavailableException("iman: невалидный XML — " + e.getMessage());
+            throw new ImanUnavailableException("LLM: невалидный XML — " + e.getMessage());
         }
     }
 
@@ -204,7 +243,7 @@ public class ImanDocumentEnricher {
             Thread.sleep(d.toMillis());
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
-            throw new ImanUnavailableException("iman: ожидание повтора прервано", ie);
+            throw new ImanUnavailableException("LLM: ожидание повтора прервано", ie);
         }
     }
 

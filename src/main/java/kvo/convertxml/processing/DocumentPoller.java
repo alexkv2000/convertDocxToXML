@@ -1,5 +1,7 @@
 package kvo.convertxml.processing;
 
+import kvo.convertxml.client.ImanDocumentEnricher;
+import kvo.convertxml.client.LlmAvailability;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -23,6 +25,8 @@ public class DocumentPoller {
 
     private final DocumentTaskDao dao;
     private final DocumentProcessingService service;
+    private final LlmAvailability llm;
+    private final ImanDocumentEnricher enricher;
     private final InstanceId instanceId;
     private final ThreadPoolTaskExecutor workers;
     private final int batchSize;
@@ -42,11 +46,13 @@ public class DocumentPoller {
                           DocumentProcessingService service,
                           InstanceId instanceId,
                           @Qualifier("docWorkers") ThreadPoolTaskExecutor docWorkers,
-                          @Value("${app.worker-threads:4}") int workerThreads,
+                          @Value("${app.exec.light.core:4}") int workerThreads,
                           @Value("${app.batch-size:5}") int batchSize,
                           @Value("${app.stale-timeout-sec:900}") int staleTimeoutSec,
                           @Value("${app.max-retries:3}") int maxRetries,
-                          @Value("${app.retry-delay-sec:60}") int retryDelaySec) {
+                          @Value("${app.retry-delay-sec:60}") int retryDelaySec,
+                          LlmAvailability llm,
+                          ImanDocumentEnricher enricher) {
         this.dao = dao;
         this.service = service;
         this.instanceId = instanceId;
@@ -56,6 +62,8 @@ public class DocumentPoller {
         this.maxRetries = maxRetries;
         this.retryDelaySec = retryDelaySec;
         this.inFlight = new Semaphore(workerThreads);
+        this.llm = llm;
+        this.enricher = enricher;
     }
 
     /** Ингест: перенос новых файлов из таблиц DocsVision в очередь (только чтение источников). */
@@ -77,9 +85,22 @@ public class DocumentPoller {
             log.error("Ошибка загрузки новых задач", e);
         }
     }
-
+    private void probeLlm() {
+        if (!llm.shouldProbe()) return;            // не чаще раза в минуту
+        try {
+            enricher.ping();                       // таймаут 10 с, не 180
+            llm.success();                         // внутри отлогируется «возобновляем»
+        } catch (Exception e) {
+            log.warn("LLM не отвечает на пробу ({}), продолжаем ждать", e.getMessage());
+            llm.failure();                         // продлевает паузу
+        }
+    }
     @Scheduled(fixedDelayString = "${app.poll-interval-ms:5000}")
     public void poll() {
+        if (llm.isPaused()) {      // если LMM лежит: БД не трогаем — ни claim, ни подсчёт очереди
+            probeLlm();
+            return;
+        }
         int available = inFlight.availablePermits();
         if (available <= 0) {
             return; // все слоты заняты — новые задачи не берём
