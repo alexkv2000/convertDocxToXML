@@ -21,16 +21,13 @@ import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 @Component
 public class ImanDocumentEnricher {
 
     private static final Logger log = LoggerFactory.getLogger(ImanDocumentEnricher.class);
-    private static final Pattern TAG = Pattern.compile("<(/?)([A-Za-z][A-Za-z0-9_.-]*)((?:\"[^\"]*\"|'[^']*'|[^>\"'])*?)(/?)>");
     private final LlmAvailability llm;
-    private final ImanTokenHolder tokens;              // НОВОЕ: живой access_token + авто-refresh
+    private final ImanTokenHolder tokens;              // живой access_token + авто-refresh
     private final RestClient pingClient;
     // Имена полей OpenAI-совместимого /chat/completions
     private static final String KEY_ERROR = "error";
@@ -47,16 +44,27 @@ public class ImanDocumentEnricher {
     private final RestClient restClient;
     private final DocumentBuilderFactory dbf;
 
+    /** Найденный XML-тег: позиция '<', позиция сразу за '>', имя, закрывающий ли, самозакрывающийся ли. */
+    private record Tag(int start, int end, String name, boolean closing, boolean selfClosing) {}
+
+    /** Правка автопочинки: вставить закрывающий тег tag в позицию pos. */
+    private record TagFix(int pos, String tag) {}
+
+    /** Разобранный ответ /chat/completions. */
+    private record Completion(String content, String finishReason,
+                              int promptTokens, int completionTokens) {
+    }
+
     public ImanDocumentEnricher(ImanProperties props,
                                 LlmAvailability llm,
-                                ImanTokenHolder tokens,              // НОВОЕ
+                                ImanTokenHolder tokens,
                                 @Value("${app.prompt}") String prompt) {
         if (prompt == null || prompt.isBlank()) {
             throw new IllegalStateException("app.prompt не задан (application.yml) — промпт обязателен");
         }
         this.props = props;
         this.llm = llm;
-        this.tokens = tokens;                                          // НОВОЕ
+        this.tokens = tokens;
         this.prompt = prompt;
         // HTTP/1.1: после GOAWAY от балансировщика HTTP/2-клиент JDK продолжал слать запросы
         // в «мёртвое» мультиплексированное соединение — проба вечно висела на нём
@@ -70,7 +78,7 @@ public class ImanDocumentEnricher {
         factory.setReadTimeout(props.readTimeout());
         this.restClient = RestClient.builder()
                 .requestFactory(factory)
-                // ИЗМЕНЕНО: Authorization больше не статичный defaultHeader —
+                // Authorization не статичный defaultHeader —
                 // токен может обновиться в runtime, ставим на каждый запрос
                 .build();
         JdkClientHttpRequestFactory pingFactory = new JdkClientHttpRequestFactory(
@@ -81,43 +89,15 @@ public class ImanDocumentEnricher {
         pingFactory.setReadTimeout(Duration.ofSeconds(30));
         this.pingClient = RestClient.builder()
                 .requestFactory(pingFactory)
-                .build();                                              // ИЗМЕНЕНО: см. выше
+                .build();
         this.dbf = newSecureDbf();
-    }
-
-    /** Автопочинка: дособирает пропущенные закрывающие теги и оборванный хвост.
-     *  null — если дефект сложнее (лишний закрывающий и т.п.), не берёмся. */
-    private String tryRepair(String xml) {
-        record Fix(int pos, String tag) {}
-        List<Fix> fixes = new ArrayList<>();
-        Deque<String> open = new ArrayDeque<>();
-        Matcher m = TAG.matcher(xml);
-        while (m.find()) {
-            String name = m.group(2);
-            if (m.group(1).isEmpty()) {                       // открывающий
-                if (m.group(4).isEmpty()) open.push(name);    // не self-closing
-            } else if (!open.isEmpty() && open.peek().equals(name)) {
-                open.pop();
-            } else if (open.contains(name)) {                 // пропущен </...> — дособрать
-                while (!open.peek().equals(name)) fixes.add(new Fix(m.start(), "</" + open.pop() + ">"));
-                open.pop();
-            } else {
-                return null;                                  // закрывающий без пары
-            }
-        }
-        while (!open.isEmpty()) fixes.add(new Fix(xml.length(), "</" + open.pop() + ">"));
-        if (fixes.isEmpty()) return null;
-        StringBuilder sb = new StringBuilder(xml);
-        fixes.sort(Comparator.comparingInt(Fix::pos).reversed());
-        for (Fix f : fixes) sb.insert(f.pos, f.tag());
-        return sb.toString();
     }
 
     public void ping() {
         final String token = tokens.current();
         try {
             pingClient.post()
-                    .uri(URI.create(props.baseUrl()))   // тот же полный адрес, что в attemptExtract
+                    .uri(URI.create(props.baseUrl()))   // тот же полный адрес, что в requestCompletion
                     .contentType(MediaType.APPLICATION_JSON)
                     .accept(MediaType.APPLICATION_JSON)
                     .headers(h -> h.setBearerAuth(token))
@@ -139,13 +119,14 @@ public class ImanDocumentEnricher {
 
     /** Возвращает заполненную XML-шапку <Document>...</Document>. Транзитные сбои LLM повторяем. */
     public String extractHeader(String fullDocumentText) {
-        for (int attempt = 1; attempt <= props.maxAttempts(); attempt++) {
+        final int maxAttempts = props.maxAttempts();
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
                 return attemptExtract(fullDocumentText);
             } catch (ImanUnavailableException e) {
-                log.warn("LLM: попытка {}/{} не удалась: {}",
-                        attempt, props.maxAttempts(), e.getMessage());
-                if (attempt == props.maxAttempts()) {
+                String reason = e.getMessage();
+                log.warn("LLM: попытка {}/{} не удалась: {}", attempt, maxAttempts, reason);
+                if (attempt == maxAttempts) {
                     throw e;
                 }
                 sleepQuietly(props.retryBackoff().multipliedBy(attempt));
@@ -160,51 +141,186 @@ public class ImanDocumentEnricher {
         }
         Map<String, Object> body = buildRequest(truncate(fullDocumentText));
         long started = System.currentTimeMillis();
-        final String token = tokens.current();          // НОВОЕ: токен момента запроса
-        JsonNode response;
+        final String token = tokens.current();          // токен момента запроса
+        JsonNode response = requestCompletion(body, token);
+        llm.success();                                  // HTTP 200 получен — эндпоинт жив
+        Completion c = parseCompletion(response);
+        logCompletion(c, System.currentTimeMillis() - started);
+        warnIfTruncated(c);
+        String xml = extractXml(c.content());
+        return validateOrRepair(xml);
+    }
+
+    /** Аргументы лога — заранее вычисленные переменные, без вызовов методов внутри log(...). */
+    private void logCompletion(Completion c, long elapsedMs) {
+        String model = props.model();
+        String finishReason = c.finishReason();
+        int promptTokens = c.promptTokens();
+        int completionTokens = c.completionTokens();
+        log.info("LLM {}: ответ за {} мс, finish_reason={}, tokens prompt/completion: {}/{}",
+                model, elapsedMs, finishReason, promptTokens, completionTokens);
+    }
+
+    /** POST /chat/completions; сетевые сбои помечают LLM недоступным и пробрасываются. */
+    private JsonNode requestCompletion(Map<String, Object> body, String token) {
         try {
-            response = restClient.post()
+            return restClient.post()
                     .uri(URI.create(props.baseUrl()))
                     .contentType(MediaType.APPLICATION_JSON)
                     .accept(MediaType.APPLICATION_JSON)
-                    .headers(h -> h.setBearerAuth(token))   // НОВОЕ
+                    .headers(h -> h.setBearerAuth(token))
                     .body(body)
                     .retrieve()
                     .onStatus(HttpStatusCode::isError, (req, res) -> {
-                        int code = res.getStatusCode().value();
-                        if (code == 401 || code == 403) {
-                            // НОВОЕ: токен мог протухнуть — обновляем и повторяем запрос.
-                            // Прошёл refresh — транзитный сбой, пауза не нужна.
-                            if (tokens.refreshIfStale(token)) {
-                                throw new ImanUnavailableException("LLM HTTP " + code
-                                        + ": access_token обновлён, повторяем с новым");
-                            }
-                            // refresh НЕ прошёл — аккаунт/ключ отключены: пауза, задачи не жжём
-                            llm.failure();
-                        } else if (res.getStatusCode().is5xxServerError() || code == 429) {
-                            llm.failure();   // провайдер лежит/перегружен
-                        }
+                        HttpStatusCode status = res.getStatusCode();
+                        handleLlmError(token, status);   // refresh токена / пауза / проброс
                         String err = new String(res.getBody().readAllBytes(), StandardCharsets.UTF_8);
-                        throw new ImanUnavailableException(
-                                "LLM HTTP " + res.getStatusCode() + ": " + abbreviate(err));
+                        throw new ImanUnavailableException("LLM HTTP " + status + ": " + abbreviate(err));
                     })
                     .body(JsonNode.class);
         } catch (ResourceAccessException e) {        // таймаут/обрыв/DNS — не отвечает
             llm.failure();
             throw e;                                 // дальше — как раньше, на уровень задачи
         }
-        llm.success();                              // HTTP 200 получен — эндпоинт жив
-        Completion c = parseCompletion(response);
-        log.info("LLM {}: ответ за {} мс, finish_reason={}, tokens prompt/completion: {}/{}",
-                props.model(), System.currentTimeMillis() - started,
-                c.finishReason(), c.promptTokens(), c.completionTokens());
-        if (c.completionTokens() * 5 >= props.maxTokens() * 4) {
+    }
+
+    /** Классификация HTTP-ошибки LLM. Может выбросить «повторяем с новым токеном». */
+    private void handleLlmError(String token, HttpStatusCode status) {
+        int code = status.value();
+        if (code == 401 || code == 403) {
+            // токен мог протухнуть — обновляем и повторяем запрос.
+            // Прошёл refresh — транзитный сбой, пауза не нужна.
+            if (tokens.refreshIfStale(token)) {
+                throw new ImanUnavailableException("LLM HTTP " + code
+                        + ": access_token обновлён, повторяем с новым");
+            }
+            // refresh НЕ прошёл — аккаунт/ключ отключены: пауза, задачи не жжём
+            llm.failure();
+        } else if (status.is5xxServerError() || code == 429) {
+            llm.failure();   // провайдер лежит/перегружен
+        }
+    }
+
+    private void warnIfTruncated(Completion c) {
+        int completionTokens = c.completionTokens();
+        int maxTokens = props.maxTokens();
+        if (completionTokens * 5 >= maxTokens * 4) {
             log.warn("LLM: completion_tokens={} близок к max_tokens={} — риск обрезки ответа, "
                             + "увеличьте iman.max-tokens или уменьшите iman.max-text-chars",
-                    c.completionTokens(), props.maxTokens());
+                    completionTokens, maxTokens);
         }
-        String xml = extractXml(c.content());
-        return validateOrRepair(xml);
+    }
+
+    /** Автопочинка: дособирает пропущенные закрывающие теги и оборванный хвост.
+     *  null — если дефект сложнее (лишний закрывающий и т.п.), не берёмся. */
+    private String tryRepair(String xml) {
+        List<TagFix> fixes = new ArrayList<>();
+        Deque<String> open = new ArrayDeque<>();
+        for (Tag t : scanTags(xml)) {
+            if (!applyTag(t, open, fixes)) {
+                return null;                 // закрывающий без пары — не берёмся
+            }
+        }
+        while (!open.isEmpty()) fixes.add(new TagFix(xml.length(), "</" + open.pop() + ">"));
+        if (fixes.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder(xml);
+        fixes.sort(Comparator.comparingInt(TagFix::pos).reversed());
+        for (TagFix f : fixes) sb.insert(f.pos, f.tag());
+        return sb.toString();
+    }
+
+    /** Накладывает тег на стек открытых; false — чужой закрывающий, починка невозможна. */
+    private static boolean applyTag(Tag t, Deque<String> open, List<TagFix> fixes) {
+        if (!t.closing()) {
+            if (!t.selfClosing()) {          // открывающий и не self-closing
+                open.push(t.name());
+            }
+            return true;
+        }
+        if (!open.isEmpty() && open.peek().equals(t.name())) {
+            open.pop();                      // штатное закрытие
+            return true;
+        }
+        if (!open.contains(t.name())) {
+            return false;                    // закрывающий без пары
+        }
+        while (!open.peek().equals(t.name())) {   // пропущен </...> — дособрать
+            fixes.add(new TagFix(t.start(), "</" + open.pop() + ">"));
+        }
+        open.pop();
+        return true;
+    }
+
+    /** Линейный сканер XML-тегов вместо regex: квантифицированная альтернатива
+     *  в старом паттерне на длинных атрибутах переполняла стек рекурсии бэктрекинга. */
+    private static List<Tag> scanTags(String xml) {
+        List<Tag> tags = new ArrayList<>();
+        int pos = 0;
+        while (true) {
+            int lt = xml.indexOf('<', pos);
+            if (lt < 0) {
+                return tags;
+            }
+            Tag tag = parseTagAt(xml, lt);
+            if (tag == null) {
+                pos = lt + 1;                // '<' не начинает корректный тег — ищем дальше
+            } else {
+                tags.add(tag);
+                pos = tag.end();
+            }
+        }
+    }
+
+    /** Тег, начинающийся с '<' в позиции lt; null — если это не корректный тег
+     *  (нет имени, либо '>' вне кавычек не найден). */
+    private static Tag parseTagAt(String xml, int lt) {
+        int pos = lt + 1;
+        boolean closing = pos < xml.length() && xml.charAt(pos) == '/';
+        if (closing) {
+            pos++;
+        }
+        if (pos >= xml.length() || !isNameStart(xml.charAt(pos))) {
+            return null;
+        }
+        int nameEnd = pos + 1;
+        while (nameEnd < xml.length() && isNameChar(xml.charAt(nameEnd))) {
+            nameEnd++;
+        }
+        int gt = findTagEnd(xml, nameEnd);
+        if (gt < 0) {
+            return null;
+        }
+        String name = xml.substring(pos, nameEnd);
+        boolean selfClosing = !closing && xml.charAt(gt - 1) == '/';
+        return new Tag(lt, gt + 1, name, closing, selfClosing);
+    }
+
+    /** Конец тега: '>' вне кавычек; -1, если кавычка или тег не закрыты. */
+    private static int findTagEnd(String xml, int from) {
+        int p = from;
+        while (p < xml.length()) {
+            char c = xml.charAt(p);
+            if (c == '"' || c == '\'') {
+                int close = xml.indexOf(c, p + 1);
+                if (close < 0) {
+                    return -1;
+                }
+                p = close + 1;
+            } else if (c == '>') {
+                return p;
+            } else {
+                p++;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean isNameStart(char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    }
+
+    private static boolean isNameChar(char c) {
+        return isNameStart(c) || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
     }
 
     private String sanitize(String xml) {
@@ -226,33 +342,49 @@ public class ImanDocumentEnricher {
             validate(xml);
             return xml;
         } catch (ImanUnavailableException e) {
-            Map<String, String> fixes = new LinkedHashMap<>();   // метка → кандидат
-            fixes.put("очистка хвоста и эскейпов", sanitize(xml));
-            fixes.put("досбор тегов", tryRepair(xml));
-            String cleaned = sanitize(xml);
-            fixes.put("очистка + досбор", cleaned.equals(xml) ? null : tryRepair(cleaned));
-            for (Map.Entry<String, String> en : fixes.entrySet()) {
-                String c = en.getValue();
-                if (c == null) continue;
-                try {
-                    validate(c);                                 // повторная проверка — как просили
-                    log.warn("LLM: XML с дефектом ({}), исправлен ({})",
-                            abbreviate(e.getMessage(), 120), en.getKey());
-                    return c;
-                } catch (ImanUnavailableException ignore) { /* вариант не помог — берём следующий */ }
-            }
-            log.warn("LLM: невалидный XML, конец ответа: …{}",
-                    xml.substring(Math.max(0, xml.length() - 200)));
-            throw e;
+            return firstValid(xml, repairCandidates(xml), e);
         }
     }
 
-    /** Разобранный ответ /chat/completions. */
-    private record Completion(String content, String finishReason,
-                              int promptTokens, int completionTokens) {
+    /** Кандидаты починки: метка → вариант; порядок = приоритет применения. */
+    private Map<String, String> repairCandidates(String xml) {
+        String cleaned = sanitize(xml);
+        Map<String, String> fixes = new LinkedHashMap<>();
+        fixes.put("очистка хвоста и эскейпов", cleaned);
+        fixes.put("досбор тегов", tryRepair(xml));
+        // очистка уже не изменила ничего — комбо дублировало бы чистый досбор
+        fixes.put("очистка + досбор", cleaned.equals(xml) ? null : tryRepair(cleaned));
+        return fixes;
     }
 
-    /** choices[0] + usage; content с fallback на reasoning_content для reasoning-моделей. */
+    /** Первый кандидат, прошедший валидацию; не подошёл ни один — исходная ошибка. */
+    private String firstValid(String xml, Map<String, String> fixes, ImanUnavailableException cause) {
+        for (Map.Entry<String, String> en : fixes.entrySet()) {
+            String candidate = en.getValue();
+            if (candidate == null || !isValid(candidate)) {
+                continue;                    // вариант не помог — берём следующий
+            }
+            String defect = abbreviate(cause.getMessage(), 120);
+            String appliedFix = en.getKey();
+            log.warn("LLM: XML с дефектом ({}), исправлен ({})", defect, appliedFix);
+            return candidate;
+        }
+        String tail = xml.substring(Math.max(0, xml.length() - 200));
+        log.warn("LLM: невалидный XML, конец ответа: …{}", tail);
+        throw cause;
+    }
+
+    /** Тихая проверка кандидата (повторная валидация — как просили). */
+    private boolean isValid(String xml) {
+        try {
+            validate(xml);
+            return true;
+        } catch (ImanUnavailableException e) {
+            return false;
+        }
+    }
+
+    /** choices[0] + usage. */
     private Completion parseCompletion(JsonNode response) {
         if (response == null) {
             throw new ImanUnavailableException("LLM: пустой ответ");
@@ -269,6 +401,15 @@ public class ImanDocumentEnricher {
         }
         JsonNode choice = choices.get(0);
         String finishReason = choice.path(KEY_FINISH_REASON).asString("");
+        checkFinishReason(finishReason);
+        String content = contentOf(choice.path(KEY_MESSAGE), finishReason);
+        return new Completion(content, finishReason,
+                response.path("usage").path("prompt_tokens").asInt(-1),
+                response.path("usage").path("completion_tokens").asInt(-1));
+    }
+
+    /** Обрезанные и заблокированные ответы — ошибка; нестандартные — предупреждение. */
+    private void checkFinishReason(String finishReason) {
         if ("length".equals(finishReason)) {
             throw new ImanUnavailableException(
                     "LLM: ответ обрезан по max_tokens=" + props.maxTokens()
@@ -281,7 +422,10 @@ public class ImanDocumentEnricher {
             // не ломаем обработку, но фиксируем нестандартное поведение бэкенда
             log.warn("LLM: нестандартный finish_reason={} — проверьте ответ модели", finishReason);
         }
-        JsonNode message = choice.path(KEY_MESSAGE);
+    }
+
+    /** content с fallback на reasoning_content для reasoning-моделей. */
+    private static String contentOf(JsonNode message, String finishReason) {
         String content = message.path(KEY_CONTENT).asString("");
         if (content.isBlank()) {
             content = message.path("reasoning_content").asString("");
@@ -290,9 +434,7 @@ public class ImanDocumentEnricher {
             throw new ImanUnavailableException(
                     "LLM: пустой content (finish_reason=" + finishReason + ")");
         }
-        return new Completion(content, finishReason,
-                response.path("usage").path("prompt_tokens").asInt(-1),
-                response.path("usage").path("completion_tokens").asInt(-1));
+        return content;
     }
 
     /** OpenAI-совместимое тело запроса: system — инструкция, user — текст документа. */

@@ -116,14 +116,6 @@ public class DocToTextParser {
         return cell.isMerged() && !cell.isFirstMerged();
     }
 
-    /** Последняя grid-колонка, накрытая текущим горизонтальным объединением. */
-    private int lastColumnOfMerge(TableRow row, int c) {
-        while (c + 1 < row.numCells() && isMergeTail(row.getCell(c + 1))) {
-            c++;
-        }
-        return c;
-    }
-
     private String paragraphText(Paragraph p) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < p.numCharacterRuns(); i++) {

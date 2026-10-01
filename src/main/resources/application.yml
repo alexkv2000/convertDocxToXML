@@ -6,9 +6,9 @@ spring:
     username: DVSQL
     password: ${DB_PASSWORD}
     hikari:
-      maximum-pool-size: 45 # ФОРМУЛА: worker-threads (exec.light) + heavy-threads (exec.heavy) + 4 (поллер, ингест, резерв)
+      maximum-pool-size: 30 # ФОРМУЛА: worker-threads (exec.light) + heavy-threads (exec.heavy) + 4 (поллер, ингест, резерв)
       leak-detection-threshold: 0 # 60000
-      minimum-idle: 45
+      minimum-idle: 30
   task:
     scheduling:
       pool:
@@ -27,8 +27,8 @@ app:
     Ты получаешь текст документа. Выполни шаги : 1. Выбери из текста названия всех юр. лиц (организация-автор и контрагенты), их ИНН и КПП, если присутствуют. 2. Определи Вид документа (классификация, принятая в системах ЭДО). 3. Заполни XML-структуру по шаблону ниже данными из текста; заполни все теги, если данных нет — оставь тег пустым. 4. Выведи мне ТОЛЬКО XML без стороннего текста и без markdown. Шаблон:<Document><Header><DocumentType></DocumentType><RelatedDocument></RelatedDocument><Date></Date><Number></Number><OrderDate></OrderDate><OrderNumber></OrderNumber><CopyNumber></CopyNumber><Summa></Summa><NDS></NDS><Currency></Currency></Header><Parties><Company><Country></Country><Name></Name><Role></Role><Address></Address><INN></INN><Phone></Phone><SignatoryCompany></SignatoryCompany></Company><Counterparties><Counterparty><Country></Country><Name></Name><Address></Address><INN></INN><Phones><Phone></Phone></Phones><SignatoryCounterparty></SignatoryCounterparty></Counterparty></Counterparties></Parties></Document> Текст документа
   exec:
     light:
-      core: 40                  # лёгкий пул (обычные файлы) default - 4
-      max: 40
+      core: 25                  # лёгкий пул (обычные файлы) default - 4
+      max: 25
       queue: 0
     heavy:
       core: 1                   # тяжёлый пул (огромные файлы, чтобы не съели память) default - 1

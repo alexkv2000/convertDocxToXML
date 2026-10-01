@@ -80,13 +80,14 @@ public class ImanTokenHolder {
             String rotated = r.path("refresh_token").asString("");
             if (!rotated.isBlank() && !rotated.equals(props.refreshToken())) {
                 // если шлюз ротирует refresh_token, старый со временем перестанет работать
+                String prefix = rotated.substring(0, Math.min(8, rotated.length()));
                 log.warn("auth/refresh вернул НОВЫЙ refresh_token — сохраните его и обновите "
-                                + "IMAN_REFRESH_TOKEN (префикс): {}…",
-                        rotated.substring(0, Math.min(8, rotated.length())));
+                        + "IMAN_REFRESH_TOKEN (префикс): {}…", prefix);
             }
             return true;
         } catch (Exception e) {
-            log.warn("auth/refresh не прошёл: {}", e.getMessage());
+            String reason = e.getMessage();
+            log.warn("auth/refresh не прошёл: {}", reason);
             return false;
         }
     }
