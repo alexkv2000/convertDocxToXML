@@ -1,5 +1,7 @@
 package kvo.convertxml.parser;
 
+import kvo.convertxml.client.ImanUnavailableException;
+import kvo.convertxml.client.OcrTextClient;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.io.IOUtils;
 import org.apache.pdfbox.io.RandomAccessReadBuffer;
@@ -32,6 +34,12 @@ public class PdfToTextParser {
     private static final Pattern BULLET = Pattern.compile(
             "^\\s*([•●▪◦\\-*–—]|\\d{1,3}[.)]|[A-Za-zА-Яа-яЁё][.)])\\s+");
 
+    private final OcrTextClient ocr;
+
+    public PdfToTextParser(OcrTextClient ocr) {
+        this.ocr = ocr;
+    }
+
     public Path parseToText(String fileName, byte[] pdfBytes) {
         Path tmp = null;
         try (PDDocument doc = Loader.loadPDF(new RandomAccessReadBuffer(pdfBytes),
@@ -43,12 +51,29 @@ public class PdfToTextParser {
                     StandardOpenOption.WRITE)) {
                 writeParagraphs(lines, out);
             }
+            // Скан без текстового слоя — PDFBox не находит ни одного символа.
+            // Отдаём исходные байты в OCR-сервис и подменяем содержимое файла.
+            // Дальше по конвейеру всё идёт как раньше: текст -> LLM -> XML-шапка.
+            if (isBlank(tmp)) {
+                log.info("PDF без текстового слоя, распознаём через OCR: {}", fileName);
+                String ocrText = ocr.extractText(fileName, pdfBytes);
+                Files.writeString(tmp, ocrText, StandardCharsets.UTF_8);
+                log.info("OCR {}: распознано {} символов", fileName, ocrText.length());
+            }
             return tmp;
+        } catch (ImanUnavailableException e) {
+            // транзитный сбой (OCR недоступен) — НЕ заворачиваем: задача уйдёт на повтор, как у LLM
+            deleteQuietly(tmp);
+            throw e;
         } catch (Exception e) {
             deleteQuietly(tmp);
             throw new IllegalStateException(
                     "Не удалось разобрать pdf: " + fileName + " — " + e.getMessage(), e);
         }
+    }
+
+    private boolean isBlank(Path file) throws IOException {
+        return Files.readString(file, StandardCharsets.UTF_8).isBlank();
     }
 
     /** Склеивает строки PDF в абзацы (маркеры списков, разрывы, дефисы переноса) и пишет их в out. */

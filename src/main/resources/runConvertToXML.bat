@@ -1,9 +1,23 @@
-set DB_PASSWORD DV_Cthdbc14@
-C:\Java\jdk-17\bin\java.exe -Xmx6g -jar docx-to-xml-service-1.1.0.jar --spring.config.location=file:.\application.yml
+rem set DB_PASSWORD=DV_Cthdbc14@
+rem set IMAN_ACCESS_TOKEN=sk-8e8be9398ad34062900766c732b5f72e
+rem $env:IMAN_REFRESH_TOKEN = "долговременный_ключ"
+rem C:\Java\jdk-17\bin\java.exe -Xmx6g -jar docx-to-xml-service-1.1.0.jar --spring.config.location=file:.\application.yml
 
 rem процессы  java из PowerShell
 rem Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Select-Object ProcessId,CommandLine
 
+rem -------------------------------------------------------------------------------------------------
+rem Критерий:
+rem < 1% — конфиг выше финальный, оставляем 50 потоков, живём.
+rem 1–3% — 50 уже на грани: после поднятия read-timeout до 5m większość уйдёт в успехи, но понаблюдайте неделю.
+rem > 3% — снижайтесь до 40 и пишите админам письмом (оно у вас есть, без пункта 5): «какая загрузка инференса, какой лимит параллельности на наш токен, можно ли поднять».
+rem
+rem $t = (Select-String -Path C:/svc/docx-processor/logs/application.log -Pattern 'Request cancelled').Count
+rem >> "таймаутов=$t из $($t+11909) => {0:P2}" -f ($t/($t+11909))
+rem -------------------------------------------------------------------------------------------------
+rem узнать потолок IMAN:max-tokens (powershell):
+rem Select-String -Path C:/svc/docx-processor/logs/application.log -Pattern 'tokens prompt/completion: (\d+)/(\d+)' |  % { [int]$_.Matches[0].Groups[2].Value } | Sort-Object
+rem -------------------------------------------------------------------------------------------------
 
 rem ПРОМПТ:
 rem 1. Выбери из текста название всех юр.лиц и контрагентов (Company, Counterparties), их ИНН и дополнительную информацию если присутствуют.
@@ -93,4 +107,33 @@ rem       "acceptedOutputModes": ["text"]
 rem     },
 rem     "skillId": "default"
 rem   }
+rem }
+
+
+rem https://ai.loodsen.ru/api/v1/chat/completions
+rem Authorization: Bearer
+rem access_token: imanv_tok_v1:eyJhdWQiOlsicGxhdGZvcm1fYXBpIl0sImNpZCI6ImRlZmF1bHQiLCJleHAiOjE3OTA2ODQwMjMsImlhdCI6MTc5MDY1NTkzMCwianRpIjoiMTJmODY0ODk2NGNhNDdlODgwZjAyMmExM2M2ZWJmOGUiLCJraW5kIjoicGxhdGZvcm0iLCJwcm92aWRlciI6ImtleWNsb2FrIiwic2lkIjoiZGVmYXVsdCIsInRva2VuX3VzZSI6ImFjY2VzcyIsInR5cCI6ImludGVncmF0aW9uIiwidWlkIjo1NDF9.c15f2767fa28c954408c3c58ae78a7cc262cd5da646399cf59954728579c4a85
+rem refresh_token: imanv_tok_v1:eyJhdWQiOlsicGxhdGZvcm1fYXBpIl0sImNpZCI6ImRlZmF1bHQiLCJleHAiOjE3OTEyNjA3MzAsImlhdCI6MTc5MDY1NTkzMCwianRpIjoiZWIzMzlkY2VhMjNjNDY0MjgxMmQ0YmUyZjA5MzQyOWYiLCJraW5kIjoicGxhdGZvcm0iLCJwcm92aWRlciI6ImtleWNsb2FrIiwic2lkIjoiZGVmYXVsdCIsInRva2VuX3VzZSI6InJlZnJlc2giLCJ0eXAiOiJpbnRlZ3JhdGlvbiIsInVpZCI6NTQxfQ.52ee8d17d363b3f2a6c4bb679a8c1369a4dc53342d572305b4773b9a08ade344
+rem
+rem curl -sS -X POST "https://iman.ai.loodsen.ru/auth/refresh" \
+rem       -H "Content-Type: application/json" \
+rem       -d '{"refresh_token":"imanv_tok_v1:eyJhdWQiOlsicGxhdGZvcm1fYXBpIl0sImNpZCI6ImRlZmF1bHQiLCJleHAiOjE3OTEyNjA3MzAsImlhdCI6MTc5MDY1NTkzMCwianRpIjoiZWIzMzlkY2VhMjNjNDY0MjgxMmQ0YmUyZjA5MzQyOWYiLCJraW5kIjoicGxhdGZvcm0iLCJwcm92aWRlciI6ImtleWNsb2FrIiwic2lkIjoiZGVmYXVsdCIsInRva2VuX3VzZSI6InJlZnJlc2giLCJ0eXAiOiJpbnRlZ3JhdGlvbiIsInVpZCI6NTQxfQ.52ee8d17d363b3f2a6c4bb679a8c1369a4dc53342d572305b4773b9a08ade344"}'
+rem
+rem curl -sS "https://iman.ai.loodsen.ru/api/v1/agents/list?my_agents=true" \
+rem      -H "Authorization: Bearer imanv_tok_v1:eyJhdWQiOlsicGxhdGZvcm1fYXBpIl0sImNpZCI6ImRlZmF1bHQiLCJleHAiOjE3OTA2ODQwMjMsImlhdCI6MTc5MDY1NTkzMCwianRpIjoiMTJmODY0ODk2NGNhNDdlODgwZjAyMmExM2M2ZWJmOGUiLCJraW5kIjoicGxhdGZvcm0iLCJwcm92aWRlciI6ImtleWNsb2FrIiwic2lkIjoiZGVmYXVsdCIsInRva2VuX3VzZSI6ImFjY2VzcyIsInR5cCI6ImludGVncmF0aW9uIiwidWlkIjo1NDF9.c15f2767fa28c954408c3c58ae78a7cc262cd5da646399cf59954728579c4a85"
+rem {
+rem   "model": "Qwen/Qwen3.5-27B-FP8",
+rem   "messages": [
+rem     {
+rem       "role": "system",
+rem       "content": "Расскажи о том что спросит пользователь."
+rem     },
+rem     {
+rem       "role": "user",
+rem       "content": "красивые виды лесов"
+rem     }
+rem   ],
+rem   "temperature": 0.1,
+rem   "max_tokens": 10000,
+rem   "stream": false
 rem }

@@ -10,6 +10,8 @@ public record ImanProperties(
         String baseUrl,       // ПОЛНЫЙ адрес: https://ai.loodsen.ru/api/v1/chat/completions
         String model,         // Qwen/Qwen3-Coder-Next-FP8
         String accessToken,
+        String refreshToken,   // привяжется к iman.refresh-token
+        String refreshUrl,     // привяжется к iman.refresh-url
         double temperature,   // 0 = детерминированно (0.0 неотличим от «не задано»)
         int maxTokens,
         Duration connectTimeout,

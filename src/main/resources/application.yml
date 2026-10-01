@@ -9,7 +9,6 @@ spring:
       maximum-pool-size: 45 # ФОРМУЛА: worker-threads (exec.light) + heavy-threads (exec.heavy) + 4 (поллер, ингест, резерв)
       leak-detection-threshold: 0 # 60000
       minimum-idle: 45
-
   task:
     scheduling:
       pool:
@@ -40,9 +39,11 @@ iman:
   base-url: https://ai.loodsen.ru/api/v1/chat/completions   # https://iman.ai.loodsen.ru
   model: Qwen/Qwen3-Coder-Next-FP8
 #  agent: example_react
-  access-token: ${IMAN_ACCESS_TOKEN}                        # не хранить токен в git
+  access-token: ${IMAN_ACCESS_TOKEN:}                        # не хранить токен в git
+  refresh-token: ${IMAN_REFRESH_TOKEN:}    # долговременный ключ — только в env
+  refresh-url: ${IMAN_REFRESH_URL:https://iman.ai.loodsen.ru/auth/refresh}
   temperature: 0.1
-  max-tokens: 6500                                         # потолок 10000
+  max-tokens: 10000                                         # потолок 10000
   # узнать потолок (powershell):
   #  Select-String -Path C:/svc/docx-processor/logs/application.log -Pattern 'tokens prompt/completion: (\d+)/(\d+)' |  % { [int]$_.Matches[0].Groups[2].Value } | Sort-Object
   connect-timeout: 10s
@@ -57,3 +58,9 @@ logging:
     kvo.convertXML: INFO
     org.apache.pdfbox: ERROR
     org.apache.poi.hwpf: ERROR  # отключить на Прод
+ocr:
+  url: http://doc-app8:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b/ToolsPage/ReadFile
+  connect-timeout: 10s
+  read-timeout: 600s      # многостраничные сканы могут распознаваться долго
+  max-attempts: 2
+  retry-backoff: 10s

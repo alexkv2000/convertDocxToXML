@@ -10,6 +10,7 @@ import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
 import org.xml.sax.InputSource;
 import tools.jackson.databind.JsonNode;
 
@@ -19,14 +20,17 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Component
 public class ImanDocumentEnricher {
 
     private static final Logger log = LoggerFactory.getLogger(ImanDocumentEnricher.class);
+    private static final Pattern TAG = Pattern.compile("<(/?)([A-Za-z][A-Za-z0-9_.-]*)((?:\"[^\"]*\"|'[^']*'|[^>\"'])*?)(/?)>");
     private final LlmAvailability llm;
+    private final ImanTokenHolder tokens;              // НОВОЕ: живой access_token + авто-refresh
     private final RestClient pingClient;
     // Имена полей OpenAI-совместимого /chat/completions
     private static final String KEY_ERROR = "error";
@@ -45,12 +49,14 @@ public class ImanDocumentEnricher {
 
     public ImanDocumentEnricher(ImanProperties props,
                                 LlmAvailability llm,
+                                ImanTokenHolder tokens,              // НОВОЕ
                                 @Value("${app.prompt}") String prompt) {
         if (prompt == null || prompt.isBlank()) {
             throw new IllegalStateException("app.prompt не задан (application.yml) — промпт обязателен");
         }
         this.props = props;
         this.llm = llm;
+        this.tokens = tokens;                                          // НОВОЕ
         this.prompt = prompt;
         // HTTP/1.1: после GOAWAY от балансировщика HTTP/2-клиент JDK продолжал слать запросы
         // в «мёртвое» мультиплексированное соединение — проба вечно висела на нём
@@ -64,7 +70,8 @@ public class ImanDocumentEnricher {
         factory.setReadTimeout(props.readTimeout());
         this.restClient = RestClient.builder()
                 .requestFactory(factory)
-                .defaultHeader("Authorization", "Bearer " + props.accessToken())
+                // ИЗМЕНЕНО: Authorization больше не статичный defaultHeader —
+                // токен может обновиться в runtime, ставим на каждый запрос
                 .build();
         JdkClientHttpRequestFactory pingFactory = new JdkClientHttpRequestFactory(
                 HttpClient.newBuilder()
@@ -74,23 +81,62 @@ public class ImanDocumentEnricher {
         pingFactory.setReadTimeout(Duration.ofSeconds(30));
         this.pingClient = RestClient.builder()
                 .requestFactory(pingFactory)
-                .defaultHeader("Authorization", "Bearer " + props.accessToken())
-                .build();
+                .build();                                              // ИЗМЕНЕНО: см. выше
         this.dbf = newSecureDbf();
     }
 
-    public void ping() {
-        pingClient.post()
-                .uri(URI.create(props.baseUrl()))   // тот же полный адрес, что в attemptExtract
-                .contentType(MediaType.APPLICATION_JSON)
-                .accept(MediaType.APPLICATION_JSON)
-                .body(Map.of(
-                        "model", props.model(),
-                        "messages", List.of(Map.of("role", "user", KEY_CONTENT, "ping")),
-                        "max_tokens", 1))
-                .retrieve()
-                .toBodilessEntity();
+    /** Автопочинка: дособирает пропущенные закрывающие теги и оборванный хвост.
+     *  null — если дефект сложнее (лишний закрывающий и т.п.), не берёмся. */
+    private String tryRepair(String xml) {
+        record Fix(int pos, String tag) {}
+        List<Fix> fixes = new ArrayList<>();
+        Deque<String> open = new ArrayDeque<>();
+        Matcher m = TAG.matcher(xml);
+        while (m.find()) {
+            String name = m.group(2);
+            if (m.group(1).isEmpty()) {                       // открывающий
+                if (m.group(4).isEmpty()) open.push(name);    // не self-closing
+            } else if (!open.isEmpty() && open.peek().equals(name)) {
+                open.pop();
+            } else if (open.contains(name)) {                 // пропущен </...> — дособрать
+                while (!open.peek().equals(name)) fixes.add(new Fix(m.start(), "</" + open.pop() + ">"));
+                open.pop();
+            } else {
+                return null;                                  // закрывающий без пары
+            }
+        }
+        while (!open.isEmpty()) fixes.add(new Fix(xml.length(), "</" + open.pop() + ">"));
+        if (fixes.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder(xml);
+        fixes.sort(Comparator.comparingInt(Fix::pos).reversed());
+        for (Fix f : fixes) sb.insert(f.pos, f.tag());
+        return sb.toString();
     }
+
+    public void ping() {
+        final String token = tokens.current();
+        try {
+            pingClient.post()
+                    .uri(URI.create(props.baseUrl()))   // тот же полный адрес, что в attemptExtract
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .accept(MediaType.APPLICATION_JSON)
+                    .headers(h -> h.setBearerAuth(token))
+                    .body(Map.of(
+                            "model", props.model(),
+                            "messages", List.of(Map.of("role", "user", KEY_CONTENT, "ping")),
+                            "max_tokens", 1))
+                    .retrieve()
+                    .toBodilessEntity();
+        } catch (RestClientResponseException e) {
+            // сидели на паузе и токен протух — обновим прямо из пробы,
+            // следующая проба (через 60 с) пойдёт уже с новым токеном
+            if (e.getStatusCode().value() == 401 || e.getStatusCode().value() == 403) {
+                tokens.refreshIfStale(token);
+            }
+            throw e;
+        }
+    }
+
     /** Возвращает заполненную XML-шапку <Document>...</Document>. Транзитные сбои LLM повторяем. */
     public String extractHeader(String fullDocumentText) {
         for (int attempt = 1; attempt <= props.maxAttempts(); attempt++) {
@@ -114,30 +160,40 @@ public class ImanDocumentEnricher {
         }
         Map<String, Object> body = buildRequest(truncate(fullDocumentText));
         long started = System.currentTimeMillis();
+        final String token = tokens.current();          // НОВОЕ: токен момента запроса
         JsonNode response;
         try {
             response = restClient.post()
                     .uri(URI.create(props.baseUrl()))
                     .contentType(MediaType.APPLICATION_JSON)
                     .accept(MediaType.APPLICATION_JSON)
+                    .headers(h -> h.setBearerAuth(token))   // НОВОЕ
                     .body(body)
                     .retrieve()
                     .onStatus(HttpStatusCode::isError, (req, res) -> {
-                        // НОВОЕ: 5xx — провайдер лежит/перегружен, 4xx — эндпоинт жив
-                        if (res.getStatusCode().is5xxServerError()
-                                || res.getStatusCode().value() == 429) {
+                        int code = res.getStatusCode().value();
+                        if (code == 401 || code == 403) {
+                            // НОВОЕ: токен мог протухнуть — обновляем и повторяем запрос.
+                            // Прошёл refresh — транзитный сбой, пауза не нужна.
+                            if (tokens.refreshIfStale(token)) {
+                                throw new ImanUnavailableException("LLM HTTP " + code
+                                        + ": access_token обновлён, повторяем с новым");
+                            }
+                            // refresh НЕ прошёл — аккаунт/ключ отключены: пауза, задачи не жжём
                             llm.failure();
+                        } else if (res.getStatusCode().is5xxServerError() || code == 429) {
+                            llm.failure();   // провайдер лежит/перегружен
                         }
                         String err = new String(res.getBody().readAllBytes(), StandardCharsets.UTF_8);
                         throw new ImanUnavailableException(
                                 "LLM HTTP " + res.getStatusCode() + ": " + abbreviate(err));
                     })
                     .body(JsonNode.class);
-        } catch (ResourceAccessException e) {        // НОВОЕ: таймаут/обрыв/DNS — не отвечает
+        } catch (ResourceAccessException e) {        // таймаут/обрыв/DNS — не отвечает
             llm.failure();
             throw e;                                 // дальше — как раньше, на уровень задачи
         }
-        llm.success();                              // НОВОЕ: HTTP 200 получен — эндпоинт жив
+        llm.success();                              // HTTP 200 получен — эндпоинт жив
         Completion c = parseCompletion(response);
         log.info("LLM {}: ответ за {} мс, finish_reason={}, tokens prompt/completion: {}/{}",
                 props.model(), System.currentTimeMillis() - started,
@@ -148,14 +204,54 @@ public class ImanDocumentEnricher {
                     c.completionTokens(), props.maxTokens());
         }
         String xml = extractXml(c.content());
-        validate(xml);
-        return xml;
+        return validateOrRepair(xml);
+    }
+
+    private String sanitize(String xml) {
+        int close = xml.indexOf(DOC_CLOSE);          // дальше закрывающего — только мусор
+        String s = close >= 0 ? xml.substring(0, close + DOC_CLOSE.length()) : xml;
+        s = s.replace("\\u003c", "<")                // JSON-эскейпы, которые модель иногда не снимает
+                .replace("\\u003e", ">")
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\r", "")
+                .replace("\\\"", "\"");
+        s = s.replaceAll("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\uFFFD\\u200B-\\u200D\\uFEFF]", "");
+        return s.trim();
+    }
+
+    /** Валидация с правом на починку: пробуем варианты по очереди, строгий validate — финальный арбитр. */
+    private String validateOrRepair(String xml) {
+        try {
+            validate(xml);
+            return xml;
+        } catch (ImanUnavailableException e) {
+            Map<String, String> fixes = new LinkedHashMap<>();   // метка → кандидат
+            fixes.put("очистка хвоста и эскейпов", sanitize(xml));
+            fixes.put("досбор тегов", tryRepair(xml));
+            String cleaned = sanitize(xml);
+            fixes.put("очистка + досбор", cleaned.equals(xml) ? null : tryRepair(cleaned));
+            for (Map.Entry<String, String> en : fixes.entrySet()) {
+                String c = en.getValue();
+                if (c == null) continue;
+                try {
+                    validate(c);                                 // повторная проверка — как просили
+                    log.warn("LLM: XML с дефектом ({}), исправлен ({})",
+                            abbreviate(e.getMessage(), 120), en.getKey());
+                    return c;
+                } catch (ImanUnavailableException ignore) { /* вариант не помог — берём следующий */ }
+            }
+            log.warn("LLM: невалидный XML, конец ответа: …{}",
+                    xml.substring(Math.max(0, xml.length() - 200)));
+            throw e;
+        }
     }
 
     /** Разобранный ответ /chat/completions. */
     private record Completion(String content, String finishReason,
                               int promptTokens, int completionTokens) {
     }
+
     /** choices[0] + usage; content с fallback на reasoning_content для reasoning-моделей. */
     private Completion parseCompletion(JsonNode response) {
         if (response == null) {
@@ -210,7 +306,6 @@ public class ImanDocumentEnricher {
                 "max_tokens", props.maxTokens(),
                 "stream", false);
     }
-
 
     /** Вырезает <Document>...</Document> из ответа модели (в т.ч. из markdown-заборов ```xml). */
     private String extractXml(String agentText) {
