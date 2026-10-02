@@ -14,7 +14,9 @@ import kvo.convertxml.infra.DocumentTaskDao;
 import kvo.convertxml.infra.DocumentTaskDao.TaskHeader;
 import kvo.convertxml.infra.InstanceId;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.Semaphore;
 import java.util.stream.Collectors;
 
@@ -96,63 +98,77 @@ public class DocumentPoller {
         }
     }
     @Scheduled(fixedDelayString = "${app.poll-interval-ms:5000}")
+    @Scheduled(fixedDelayString = "${app.poll-interval-ms:5000}")
     public void poll() {
-        if (llm.isPaused()) {      // если LMM лежит: БД не трогаем — ни claim, ни подсчёт очереди
+        if (llm.isPaused()) {
             probeLlm();
             return;
         }
         int available = inFlight.availablePermits();
         if (available <= 0) {
-            return; // все слоты заняты — новые задачи не берём
+            return;
         }
-        List<Long> ids;
+        List<DocumentTaskDao.Claim> claims;
         try {
-            ids = dao.claimBatch(instanceId.get(), Math.min(batchSize, available),
+            claims = dao.claimBatch(instanceId.get(), Math.min(batchSize, available),
                     staleTimeoutSec, maxRetries, retryDelaySec);
         } catch (Exception e) {
             log.error("Ошибка захвата задач", e);
             return;
         }
-        if (ids.isEmpty()) {
+        if (claims.isEmpty()) {
             return;
         }
-        // Заголовки + размеры бинарников одним запросом на всю партию —
-        // вместо отдельных запросов на каждую задачу
+        Map<Long, UUID> tokens = claims.stream()
+                .collect(Collectors.toMap(DocumentTaskDao.Claim::id, DocumentTaskDao.Claim::token));
         List<TaskHeader> headers;
         try {
-            headers = dao.headersFor(ids);
+            headers = dao.headersFor(claims.stream().map(DocumentTaskDao.Claim::id).toList());
         } catch (Exception e) {
-            log.error("Ошибка чтения заголовков для {} задач — stale-таймаут подберёт", ids.size(), e);
+            log.error("Ошибка чтения заголовков для {} задач — возвращаем в очередь", claims.size(), e);
+            for (DocumentTaskDao.Claim c : claims) {
+                requeueQuietly(c.id(), c.token(), 60);
+            }
             return;
         }
-        if (headers.size() != ids.size()) {
+        if (headers.size() != claims.size()) {
             Set<Long> found = headers.stream().map(TaskHeader::id).collect(Collectors.toSet());
-            List<Long> missing = ids.stream().filter(id -> !found.contains(id)).toList();
+            List<DocumentTaskDao.Claim> missing = claims.stream()
+                    .filter(c -> !found.contains(c.id())).toList();
             dao.failMissing(instanceId.get(), missing);
-            log.warn("Захвачено {}, заголовков {} — {} задач без исходника помечены ошибкой (status=3)",
-                    ids.size(), headers.size(), missing);
+            log.warn("Захвачено {}, заголовков {} — {} задач без исходника помечены (status=3)",
+                    claims.size(), headers.size(), missing.size());
         }
         log.info("[{}] захвачено задач: {}", instanceId.get(), headers.size());
         for (TaskHeader header : headers) {
+            UUID token = tokens.get(header.id());
             try {
-                // acquire не заблокируется: available проверен, а acquire-ов кроме нас нет
                 inFlight.acquire();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return; // незапущенные задачи подберёт stale-таймаут
+                requeueQuietly(header.id(), token, 10);
+                return;
             }
             try {
                 workers.execute(() -> {
                     try {
-                        service.process(header);
+                        service.process(header, token);
                     } finally {
                         inFlight.release();
                     }
                 });
             } catch (RuntimeException e) {
                 inFlight.release();
-                log.error("Задача {} не поставлена в пул — повтор по stale-таймауту", header.id(), e);
+                requeueQuietly(header.id(), token, 10);
+                log.error("Задача {} не поставлена в пул — возвращена в очередь", header.id(), e);
             }
+        }
+    }
+    private void requeueQuietly(long id, UUID token, int delaySec) {
+        try {
+            dao.markTransient(id, instanceId.get(), token, delaySec);
+        } catch (Exception e) {
+            log.error("Не удалось вернуть задачу {} в очередь — подберёт stale-таймаут", id, e);
         }
     }
 }

@@ -1,7 +1,8 @@
 package kvo.convertxml.parser;
 
 import kvo.convertxml.client.ImanUnavailableException;
-import kvo.convertxml.client.OcrTextClient;
+import kvo.convertxml.client.OcrRouter;
+import kvo.convertxml.client.OcrUnavailableException;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.io.IOUtils;
 import org.apache.pdfbox.io.RandomAccessReadBuffer;
@@ -11,6 +12,7 @@ import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.TextPosition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.BufferedWriter;
@@ -25,46 +27,56 @@ import java.util.regex.Pattern;
 
 @Component
 public class PdfToTextParser {
-
     private static final Logger log = LoggerFactory.getLogger(PdfToTextParser.class);
-
     /** Абзац рвём, когда вертикальный промежуток между строками больше 1.3 высоты шрифта. */
     private static final float PARAGRAPH_GAP_FACTOR = 1.3f;
     /** Маркеры списков: тире, точки-буллеты, "1.", "1)", "а)". */
     private static final Pattern BULLET = Pattern.compile(
             "^\\s*([•●▪◦\\-*–—]|\\d{1,3}[.)]|[A-Za-zА-Яа-яЁё][.)])\\s+");
 
-    private final OcrTextClient ocr;
+    private final OcrRouter ocr;
+    private final long ocrMaxBytes;
 
-    public PdfToTextParser(OcrTextClient ocr) {
+    public PdfToTextParser(OcrRouter ocr,
+                           @Value("${app.ocr-max-mb:5}") int ocrMaxMb) {
         this.ocr = ocr;
+        this.ocrMaxBytes = ocrMaxMb * 1024L * 1024L;
     }
 
     public Path parseToText(String fileName, byte[] pdfBytes) {
         Path tmp = null;
-        try (PDDocument doc = Loader.loadPDF(new RandomAccessReadBuffer(pdfBytes),
-                IOUtils.createTempFileOnlyStreamCache())) {
-            List<PdfLine> lines = new LineCollector().extract(doc);
+        try {
             tmp = Files.createTempFile("doctext-", ".txt");
-            try (BufferedWriter out = Files.newBufferedWriter(tmp, StandardCharsets.UTF_8,
-                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
-                    StandardOpenOption.WRITE)) {
-                writeParagraphs(lines, out);
+            boolean scanned;
+            try (PDDocument doc = Loader.loadPDF(new RandomAccessReadBuffer(pdfBytes),
+                    IOUtils.createTempFileOnlyStreamCache())) {
+                List<PdfLine> lines = new LineCollector().extract(doc);
+                try (BufferedWriter out = Files.newBufferedWriter(tmp, StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                        StandardOpenOption.WRITE)) {
+                    writeParagraphs(lines, out);
+                }
+                scanned = isBlank(tmp);
             }
-            // Скан без текстового слоя — PDFBox не находит ни одного символа.
-            // Отдаём исходные байты в OCR-сервис и подменяем содержимое файла.
-            // Дальше по конвейеру всё идёт как раньше: текст -> LLM -> XML-шапка.
-            if (isBlank(tmp)) {
+            // PDFBox закрыт ДО OCR: не держим документ в памяти на время распознавания.
+            if (scanned) {
+                if (pdfBytes.length > ocrMaxBytes) {
+                    throw new OcrSizeLimitException("Превышен максимальный размер файла для OCR ("
+                            + ocrMaxBytes / 1024 / 1024 + " МБ), фактический размер: "
+                            + pdfBytes.length / 1024 / 1024 + " МБ");
+                }
                 log.info("PDF без текстового слоя, распознаём через OCR: {}", fileName);
                 String ocrText = ocr.extractText(fileName, pdfBytes);
                 Files.writeString(tmp, ocrText, StandardCharsets.UTF_8);
                 log.info("OCR {}: распознано {} символов", fileName, ocrText.length());
             }
             return tmp;
-        } catch (ImanUnavailableException e) {
-            // транзитный сбой (OCR недоступен) — НЕ заворачиваем: задача уйдёт на повтор, как у LLM
+        } catch (OcrSizeLimitException e) {
             deleteQuietly(tmp);
-            throw e;
+            throw e;   // выше уйдёт в DocumentProcessingService -> dao.markRejected(...)
+        } catch (ImanUnavailableException | OcrUnavailableException e) {
+            deleteQuietly(tmp);
+            throw e;   // транзитный сбой — задача уйдёт на повтор
         } catch (Exception e) {
             deleteQuietly(tmp);
             throw new IllegalStateException(
@@ -75,6 +87,8 @@ public class PdfToTextParser {
     private boolean isBlank(Path file) throws IOException {
         return Files.readString(file, StandardCharsets.UTF_8).isBlank();
     }
+
+    // ================== всё ниже без изменений ==================
 
     /** Склеивает строки PDF в абзацы (маркеры списков, разрывы, дефисы переноса) и пишет их в out. */
     private void writeParagraphs(List<PdfLine> lines, BufferedWriter out) throws IOException {

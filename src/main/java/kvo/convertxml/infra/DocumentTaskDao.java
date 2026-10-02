@@ -6,6 +6,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Repository
 public class DocumentTaskDao {
@@ -43,23 +46,18 @@ public class DocumentTaskDao {
             WITH picked AS (
                 SELECT TOP (?) id
                 FROM dbo.doc_documents WITH (UPDLOCK, ROWLOCK, READPAST)
-                WHERE status = 0
+                WHERE (status = 0 AND (next_attempt_at IS NULL OR next_attempt_at <= SYSUTCDATETIME()))
                    OR (status = 1 AND locked_at IS NOT NULL
-                       AND locked_at < DATEADD(SECOND, -?, SYSUTCDATETIME()))
+                           AND locked_at < DATEADD(SECOND, -?, SYSUTCDATETIME()))
                    OR (status = 3 AND retry_count < ?
-                       AND updated_at IS NOT NULL
-                       AND updated_at < DATEADD(SECOND, -?, SYSUTCDATETIME()))
-                ORDER BY CASE
-                             WHEN status = 1 THEN 0
-                             WHEN status = 0 THEN 1
-                             ELSE 2
-                         END, id
+                           AND updated_at IS NOT NULL
+                           AND updated_at < DATEADD(SECOND, -?, SYSUTCDATETIME()))
+                ORDER BY CASE WHEN status = 1 THEN 0 WHEN status = 0 THEN 1 ELSE 2 END, id
             )
             UPDATE d
-               SET d.status    = 1,
-                   d.locked_by = ?,
-                   d.locked_at = SYSUTCDATETIME()
-            OUTPUT INSERTED.id
+               SET d.status = 1, d.locked_by = ?, d.locked_at = SYSUTCDATETIME(),
+                   d.claim_token = ?
+            OUTPUT INSERTED.id, INSERTED.claim_token
             FROM dbo.doc_documents AS d
             JOIN picked ON picked.id = d.id
             """;
@@ -83,8 +81,9 @@ public class DocumentTaskDao {
     private static final String SQL_DONE_RELEASE = """
             UPDATE dbo.doc_documents
                SET status = 2, error_message = NULL,
-                   locked_by = NULL, locked_at = NULL, updated_at = SYSUTCDATETIME()
-             WHERE id = ? AND locked_by = ?
+                   locked_by = NULL, locked_at = NULL, claim_token = NULL,
+                   updated_at = SYSUTCDATETIME()
+             WHERE id = ? AND locked_by = ? AND claim_token = ?
             """;
 
     private static final String SQL_DONE_INSERT_RESULT = """
@@ -100,8 +99,8 @@ public class DocumentTaskDao {
             UPDATE dbo.doc_documents
                SET status = 3, error_message = ?,
                    retry_count = retry_count + 1,
-                   locked_by = NULL, locked_at = NULL, updated_at = SYSUTCDATETIME()
-             WHERE id = ? AND locked_by = ?
+                   locked_by = NULL, locked_at = NULL, claim_token = NULL, updated_at = SYSUTCDATETIME()
+             WHERE id = ? AND locked_by = ? AND claim_token = ?
             """;
     private static final String SQL_EMPTY_RESULT = """
             UPDATE dbo.doc_documents
@@ -110,23 +109,46 @@ public class DocumentTaskDao {
                    retry_count = retry_count + 1,   -- иначе claimBatch перезахватит по retry-ветке
                    locked_by = NULL,
                    locked_at = NULL,
+                   claim_token = NULL,
                    updated_at = SYSUTCDATETIME()    -- пауза retry-delay перед повтором
-             WHERE id = ? AND locked_by = ?
+             WHERE id = ? AND locked_by = ? AND claim_token = ?
             """;
-
+    private static final String SQL_MARK_TRANSIENT = """
+            UPDATE dbo.doc_documents
+               SET status = 0,
+                   next_attempt_at = DATEADD(SECOND, ?, SYSUTCDATETIME()),
+                   locked_by = NULL, locked_at = NULL, claim_token = NULL,
+                   updated_at = SYSUTCDATETIME()
+             WHERE id = ? AND locked_by = ? AND claim_token = ?
+            """;
+    private static final String SQL_HEARTBEAT = """
+            UPDATE d SET d.locked_at = SYSUTCDATETIME(), d.updated_at = SYSUTCDATETIME()
+            FROM dbo.doc_documents AS d
+            JOIN (VALUES %s) AS v(id, tok) ON v.id = d.id AND v.tok = d.claim_token
+            WHERE d.locked_by = ? AND d.status = 1
+            """;
+    private static final String SQL_MARK_REJECTED = """
+            UPDATE dbo.doc_documents
+               SET status = 3, error_message = ?,
+                   retry_count = 9999,               -- выше любого max-retries: повторов не будет
+                   locked_by = NULL, locked_at = NULL, claim_token = NULL,
+                   updated_at = SYSUTCDATETIME()
+             WHERE id = ? AND locked_by = ? AND claim_token = ?
+            """;
     private final JdbcTemplate jdbc;
     private final TransactionTemplate tx;
+
+    /** Неустранимая ошибка: ERROR навсегда, claimBatch больше не возьмёт эту задачу. */
+    public boolean markRejected(long id, String instanceId, UUID token, String error) {
+        return jdbc.update(SQL_MARK_REJECTED, error, id, instanceId, token.toString()) > 0;
+    }
 
     public DocumentTaskDao(JdbcTemplate jdbc, TransactionTemplate tx) {
         this.jdbc = jdbc;
         this.tx = tx;
     }
 
-    /**
-     * Пустой результат: ERROR без записи в doc_results.
-     */
-    public boolean markEmptyResult(long id, String instanceId) {
-        return jdbc.update(SQL_EMPTY_RESULT, id, instanceId) > 0;
+    public record Claim(long id, UUID token) {
     }
 
     /**
@@ -141,10 +163,48 @@ public class DocumentTaskDao {
      * Атомарный захват пачки задач (UPDLOCK+ROWLOCK+READPAST).
      * Забираются новые, зависшие PROCESSING и ERROR с правом повтора.
      */
-    public List<Long> claimBatch(String instanceId, int batchSize,
-                                 int staleTimeoutSec, int maxRetries, int retryDelaySec) {
-        return jdbc.queryForList(SQL_CLAIM_BATCH, Long.class,
-                batchSize, staleTimeoutSec, maxRetries, retryDelaySec, instanceId);
+    public List<Claim> claimBatch(String instanceId, int batchSize,
+                                  int staleTimeoutSec, int maxRetries, int retryDelaySec) {
+        String token = UUID.randomUUID().toString();
+        return jdbc.query(SQL_CLAIM_BATCH,
+                (rs, i) -> new Claim(rs.getLong("id"), UUID.fromString(rs.getString("claim_token"))),
+                batchSize, staleTimeoutSec, maxRetries, retryDelaySec,
+                instanceId, token);
+    }
+
+    /**
+     * Транзитный сбой: в очередь с паузой, БЕЗ роста retry_count.
+     */
+    public boolean markTransient(long id, String instanceId, UUID token, int delaySec) {
+        return jdbc.update(SQL_MARK_TRANSIENT, delaySec, id, instanceId, token.toString()) > 0;
+    }
+
+    /**
+     * Пустой результат: ERROR без записи в doc_results.
+     */
+    public boolean markEmptyResult(long id, String instanceId, UUID token) {
+        return jdbc.update(SQL_EMPTY_RESULT, id, instanceId, token.toString()) > 0;
+    }
+
+    public boolean markFailed(long id, String instanceId, UUID token, String error) {
+        String msg = error.length() > 2000 ? error.substring(0, 2000) : error;
+        return jdbc.update(SQL_MARK_FAILED, msg, id, instanceId, token.toString()) > 0;
+    }
+
+    public void heartbeat(String instanceId, Map<Long, UUID> claims) {
+        List<Map.Entry<Long, UUID>> all = List.copyOf(claims.entrySet());
+        for (int from = 0; from < all.size(); from += 200) {
+            var part = all.subList(from, Math.min(from + 200, all.size()));
+            String vals = part.stream().map(e -> "(?,?)").collect(Collectors.joining(","));
+            Object[] args = new Object[part.size() * 2 + 1];
+            int i = 0;
+            for (var e : part) {
+                args[i++] = e.getKey();
+                args[i++] = e.getValue().toString();
+            }
+            args[i] = instanceId;
+            jdbc.update(String.format(SQL_HEARTBEAT, vals), args);
+        }
     }
 
     public record TaskHeader(long id, String fileId, String fileName, long sizeBytes) {
@@ -177,25 +237,17 @@ public class DocumentTaskDao {
      * Фиксация результата в ОДНОЙ транзакции: статус DONE в очереди +
      * строка в doc_results. WHERE locked_by = ? — fencing.
      */
-    public boolean markDone(long id, String instanceId, String text) {
+    public boolean markDone(long id, String instanceId, UUID token, String text) {
         Boolean ok = tx.execute(status -> {
-            int updated = jdbc.update(SQL_DONE_RELEASE, id, instanceId);
+            int updated = jdbc.update(SQL_DONE_RELEASE, id, instanceId, token.toString());
             if (updated == 0) {
-                return false; // владение потеряно — результат отбрасываем
+                return false;                          // владение потеряно — результат отбрасываем
             }
-            jdbc.update(SQL_DONE_DELETE_RESULT, id); // если результат есть в таблице - Удалить на ПРОДЕ!
+            jdbc.update(SQL_DONE_DELETE_RESULT, id);
             jdbc.update(SQL_DONE_INSERT_RESULT, text, instanceId, id);
             return true;
         });
         return Boolean.TRUE.equals(ok);
-    }
-
-    /**
-     * Ошибка: счётчик попыток +1, повтор после retry-delay.
-     */
-    public boolean markFailed(long id, String instanceId, String error) {
-        String msg = error.length() > 2000 ? error.substring(0, 2000) : error;
-        return jdbc.update(SQL_MARK_FAILED, msg, id, instanceId) > 0;
     }
 
     private static final String SQL_FAIL_MISSING = """
@@ -203,15 +255,14 @@ public class DocumentTaskDao {
                SET status = 3,
                    error_message = N'Исходный файл недоступен (удалён из DocsVision)',
                    retry_count = retry_count + 1,
-                   locked_by = NULL,
-                   locked_at = NULL,
+                   locked_by = NULL, locked_at = NULL, claim_token = NULL,
                    updated_at = SYSUTCDATETIME()
-             WHERE id = ? AND locked_by = ?
+             WHERE id = ? AND locked_by = ? AND claim_token = ?
             """;
 
-    public void failMissing(String instanceId, List<Long> ids) {
+    public void failMissing(String instanceId, List<Claim> ids) {
         if (ids.isEmpty()) return;
         jdbc.batchUpdate(SQL_FAIL_MISSING,
-                ids.stream().map(id -> new Object[]{id, instanceId}).toList());
+                ids.stream().map(c -> new Object[]{c.id(), instanceId, c.token().toString()}).toList());
     }
 }

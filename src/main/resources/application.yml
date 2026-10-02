@@ -1,4 +1,6 @@
 spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 80s
   application:
     name: docx-to-xml-service
   datasource:
@@ -6,13 +8,13 @@ spring:
     username: DVSQL
     password: ${DB_PASSWORD}
     hikari:
-      maximum-pool-size: 30 # ФОРМУЛА: worker-threads (exec.light) + heavy-threads (exec.heavy) + 4 (поллер, ингест, резерв)
+      maximum-pool-size: 35 # ФОРМУЛА: worker-threads (exec.light) + heavy-threads (exec.heavy) + 4 (поллер, ингест, резерв)
       leak-detection-threshold: 0 # 60000
-      minimum-idle: 30
+      minimum-idle: 35
   task:
     scheduling:
       pool:
-        size: 2
+        size: 4
 app:
   min-length-xml: 20            # минимальная длина xml успешного результата
   ingest-lookback-days: 4      # Выборка данных из DocsVision (кол-во дней назад)
@@ -20,20 +22,22 @@ app:
   ingest-interval-ms: 30000     # период поиска новых файлов в таблицах DocsVision
   batch-size: 16                # сколько задач захватывать за раз default - 5
   heavy-threshold-mb: 10        # граница "лёгкий/тяжёлый" в МБ
-  stale-timeout-sec: 900        # "зависшая" PROCESSING-задача считается потерянной
+  stale-timeout-sec: 3600        # "зависшая" PROCESSING-задача считается потерянной -900
   max-retries: 2                # максимум повторов ERROR-задачи
   retry-delay-sec: 60           # пауза перед повтором ошибочной задачи
+  ocr-max-mb: 5                 # максимальноый размер файла для парсинга (5Mb)
+  ocr-poison-retries: 5
   prompt : | 
     Ты получаешь текст документа. Выполни шаги : 1. Выбери из текста названия всех юр. лиц (организация-автор и контрагенты), их ИНН и КПП, если присутствуют. 2. Определи Вид документа (классификация, принятая в системах ЭДО). 3. Заполни XML-структуру по шаблону ниже данными из текста; заполни все теги, если данных нет — оставь тег пустым. 4. Выведи мне ТОЛЬКО XML без стороннего текста и без markdown. Шаблон:<Document><Header><DocumentType></DocumentType><RelatedDocument></RelatedDocument><Date></Date><Number></Number><OrderDate></OrderDate><OrderNumber></OrderNumber><CopyNumber></CopyNumber><Summa></Summa><NDS></NDS><Currency></Currency></Header><Parties><Company><Country></Country><Name></Name><Role></Role><Address></Address><INN></INN><Phone></Phone><SignatoryCompany></SignatoryCompany></Company><Counterparties><Counterparty><Country></Country><Name></Name><Address></Address><INN></INN><Phones><Phone></Phone></Phones><SignatoryCounterparty></SignatoryCounterparty></Counterparty></Counterparties></Parties></Document> Текст документа
   exec:
     light:
-      core: 25                  # лёгкий пул (обычные файлы) default - 4
-      max: 25
+      core: 30                  # лёгкий пул (обычные файлы) default - 4
+      max: 30
       queue: 0
     heavy:
       core: 1                   # тяжёлый пул (огромные файлы, чтобы не съели память) default - 1
       max: 1
-      queue: 500
+      queue: 4                  # очередь на тяжелые потоки не должны копить -500
 iman:
   enabled: true
   base-url: https://ai.loodsen.ru/api/v1/chat/completions   # https://iman.ai.loodsen.ru
@@ -43,24 +47,47 @@ iman:
   refresh-token: ${IMAN_REFRESH_TOKEN:}    # долговременный ключ — только в env
   refresh-url: ${IMAN_REFRESH_URL:https://iman.ai.loodsen.ru/auth/refresh}
   temperature: 0.1
-  max-tokens: 10000                                         # потолок 10000
+  max-tokens: 10000
+  max-concurrent: 8
+  slot-wait-ms: 120000
+  slow-response-ms: 30000
+  # потолок 10000
   # узнать потолок (powershell):
   #  Select-String -Path C:/svc/docx-processor/logs/application.log -Pattern 'tokens prompt/completion: (\d+)/(\d+)' |  % { [int]$_.Matches[0].Groups[2].Value } | Sort-Object
   connect-timeout: 10s
-  read-timeout: 5m                                          # было "5"
-  max-text-chars: 100000
+  read-timeout: 60s                                          # было "5m"
+  max-text-chars: 40000      # чтобы ответы не обрезались по max_tokens=10000 - 100000
   max-attempts: 2      # попыток на задачу, можно увеличит до "3"
   retry-backoff: 2s    # пауза 2с, 4с перед повторами
 logging:
   file:
     name: C:/svc/docx-processor/logs/application.log
   level:
-    kvo.convertXML: INFO
+    kvo.convertxml: INFO
     org.apache.pdfbox: ERROR
     org.apache.poi.hwpf: ERROR  # отключить на Прод
 ocr:
-  url: http://doc-app8:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b/ToolsPage/ReadFile
-  connect-timeout: 10s
-  read-timeout: 600s      # многостраничные сканы могут распознаваться долго
-  max-attempts: 2
-  retry-backoff: 10s
+  servers:
+    - http://doc-app:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b
+    - http://doc-app2:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b
+    - http://doc-app3:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b
+    - http://doc-app4:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b
+    - http://doc-app5:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b
+    - http://doc-app6:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b
+    - http://doc-app7:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b
+    - http://doc-app8:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b
+      # остальные 7 добавите при подключении; если GUID на каждом свой — он в адресе каждого
+  ocr-path: /ToolsPage/ReadFile
+  health-path: /ToolsPage/ReadFile  # ADAPT под реальный эндпоинт
+  probe-interval-ms: 5000
+  failure-cooldown: 30s
+  max-servers-per-request: 3        # пробуем до 3 серверов, потом задача в повтор
+  max-in-flight-per-server: 4       # exec.light 30 + exec.heavy 1 = 31 воркер
+  # OCR: 8 серверов × 4 слота = 32 слота  → 31 ≤ 32 ✅ сходится
+  # LLM: semafor iman.max-concurrent = 8  (ждущие слот OCR-слот НЕ держат) ✅
+  # (31 воркеров / 8 серверов ≈ 3-4; 0 = без лимита)
+  connect-timeout: 10s    # 5 секунд
+  read-timeout: 360s      # многостраничные сканы могут распознаваться долго
+  # url: http://doc-app8:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b/ToolsPage/ReadFile
+  # max-attempts: 2
+  # retry-backoff: 10s
