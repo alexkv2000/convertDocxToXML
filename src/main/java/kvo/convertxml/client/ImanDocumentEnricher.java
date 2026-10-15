@@ -240,12 +240,22 @@ public class ImanDocumentEnricher {
                         HttpStatusCode status = res.getStatusCode();
                         handleLlmError(token, status);   // refresh токена / пауза / проброс
                         String err = new String(res.getBody().readAllBytes(), StandardCharsets.UTF_8);
+                        // 401/403/429 обрабатываются в handleLlmError; прочие 4xx — ошибка (модель/URL/размер), повтор не поможет
+                        if (status.is4xxClientError()) {
+                            throw new LlmPermanentException("LLM HTTP " + status + ": "
+                                    + abbreviate(err)
+                                    + " — проверьте iman.model и iman.base-url");
+                        }
                         throw new ImanUnavailableException("LLM HTTP " + status + ": " + abbreviate(err));
                     })
                     .body(JsonNode.class);
         } catch (ResourceAccessException e) {        // таймаут/обрыв/DNS — не отвечает
             llm.failure();
-            throw e;                                 // дальше — как раньше, на уровень задачи
+            // Таймаут LLM — ТРАНЗИТНЫЙ сбой, не сбой задачи. Раньше улетал
+            // в catch(Exception) сервиса и делал markFailed (путь в ERROR).
+            // Обёртка включает и ретрай-цикл extractHeader, и requeue сервиса.
+            throw new ImanUnavailableException(                                    // +++
+                    "LLM: таймаут/сеть — " + abbreviate(e.getMessage(), 160), e);   // +++
         }
     }
 

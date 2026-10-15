@@ -98,7 +98,6 @@ public class DocumentPoller {
         }
     }
     @Scheduled(fixedDelayString = "${app.poll-interval-ms:5000}")
-    @Scheduled(fixedDelayString = "${app.poll-interval-ms:5000}")
     public void poll() {
         if (llm.isPaused()) {
             probeLlm();
