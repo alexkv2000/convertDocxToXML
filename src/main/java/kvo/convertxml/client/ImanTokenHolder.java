@@ -47,8 +47,8 @@ public class ImanTokenHolder {
 
     /**
      * Вызывается при 401/403 на запросе, ушедшем с токеном {@code failedToken}.
-     * true  — токен актуален (обновили сейчас или это сделал другой поток) — запрос можно повторять;
-     * false — refresh не прошёл (аккаунт/ключ отключены) — включать паузу.
+     * True  — токен актуален (обновили сейчас или это сделал другой поток) — запрос можно повторять;
+     * False — refresh не прошёл (аккаунт/ключ отключены) — включать паузу.
      */
     public synchronized boolean refreshIfStale(String failedToken) {
         if (!failedToken.equals(accessToken)) {

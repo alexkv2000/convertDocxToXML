@@ -71,12 +71,12 @@ public class PdfToTextParser {
                 log.info("OCR {}: распознано {} символов", fileName, ocrText.length());
             }
             return tmp;
-        } catch (OcrSizeLimitException e) {
+        } catch (OcrSizeLimitException | ImanUnavailableException | OcrUnavailableException e) {
             deleteQuietly(tmp);
-            throw e;   // выше уйдёт в DocumentProcessingService -> dao.markRejected(...)
-        } catch (ImanUnavailableException | OcrUnavailableException e) {
-            deleteQuietly(tmp);
-            throw e;   // транзитный сбой — задача уйдёт на повтор
+            // Пробрасываем как есть — диспетчеризация по типу выше, в DocumentProcessingService:
+            //   OcrSizeLimitException         -> dao.markRejected(...), терминальный отказ без retry
+            //   Iman/OcrUnavailableException  -> транзитный сбой, задача уйдёт на повтор
+            throw e;
         } catch (Exception e) {
             deleteQuietly(tmp);
             throw new IllegalStateException(
