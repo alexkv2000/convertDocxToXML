@@ -152,7 +152,7 @@ public class DocumentTaskDao {
     }
 
     /**
-     * Ингест: добавление новых задач из действующих таблиц DocsVision.
+     * Проглотить: добавление новых задач из действующих таблиц DocsVision.
      * Идемпотентно: NOT EXISTS + уникальный индекс по file_id.
      */
     public int ingestNewTasks(int lookbackDays) {
@@ -160,7 +160,7 @@ public class DocumentTaskDao {
     }
 
     /**
-     * Атомарный захват пачки задач (UPDLOCK+ROWLOCK+READPAST).
+     * Требование: Атомарный захват пачки задач (UPDLOCK+ROWLOCK+READPAST).
      * Забираются новые, зависшие PROCESSING и ERROR с правом повтора.
      */
     public List<Claim> claimBatch(String instanceId, int batchSize,

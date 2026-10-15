@@ -20,7 +20,7 @@ public record ImanProperties(
         int maxAttempts,
         Duration retryBackoff) {
 
-    /** Компактный конструктор записи: дефолты + fail-fast при старте. */
+    /** Конструктор записи: дефолты + fail-fast при старте. */
     public ImanProperties {
         if (temperature <= 0) temperature = 0.1;
         if (maxTokens <= 0) maxTokens = 10_000;

@@ -25,7 +25,7 @@ app:
   stale-timeout-sec: 3600        # "зависшая" PROCESSING-задача считается потерянной -900
   max-retries: 2                # максимум повторов ERROR-задачи
   retry-delay-sec: 60           # пауза перед повтором ошибочной задачи
-  ocr-max-mb: 5                 # максимальноый размер файла для парсинга (5Mb)
+  ocr-max-mb: 6                 # максимальный размер файла для парсинга (5Mb)
   ocr-poison-retries: 5         # документ-специфичный отказ OCR (есть)
   zombie-transient-retries: 20  # подряд транзитных сбоев ЛЮБОГО рода → REJECTED
   prompt : | 
@@ -41,10 +41,10 @@ app:
       queue: 4                  # очередь на тяжелые потоки не должны копить -500
 iman:
   enabled: true
-  base-url: https://ai.loodsen.ru/api/v1/chat/completions   # https://iman.ai.loodsen.ru
-  model: GLM-5.3-Flash-coder
-#  agent: example_react
-  access-token: ${IMAN_ACCESS_TOKEN:}                        # не хранить токен в git
+  base-url: https://ai.loodsen.ru/api/chat/completions
+  model: Qwen3.8-27B
+  #  agent: example_react
+  access-token: ${IMAN_ACCESS_TOKEN:}                        # токен — только в env
   refresh-token: ${IMAN_REFRESH_TOKEN:}    # долговременный ключ — только в env
   refresh-url: ${IMAN_REFRESH_URL:https://iman.ai.loodsen.ru/auth/refresh}
   temperature: 0.1
@@ -52,13 +52,13 @@ iman:
   max-concurrent: 8
   slot-wait-ms: 120000
   slow-response-ms: 60000
-  # потолок 10000
-  # узнать потолок (powershell):
-  #  Select-String -Path C:/svc/docx-processor/logs/application.log -Pattern 'tokens prompt/completion: (\d+)/(\d+)' |  % { [int]$_.Matches[0].Groups[2].Value } | Sort-Object
+    # потолок 10000
+    # узнать потолок (PowerShell):
+    #  Select-String -Path C:/svc/docx-processor/logs/application.log -Pattern 'tokens prompt/completion: (\d+)/(\d+)' |  % { [int]$_.Matches[0].Groups[2].Value } | Sort-Object
   connect-timeout: 10s
-  read-timeout: 180s                                          # было "5m"
+  read-timeout: 180s         # было "5m"
   max-text-chars: 40000      # чтобы ответы не обрезались по max_tokens=10000 - 100000
-  max-attempts: 2      # попыток на задачу, можно увеличит до "3"
+  max-attempts: 3      # попыток на задачу, можно увеличит до "3"
   retry-backoff: 2s    # пауза 2с, 4с перед повторами
 logging:
   file:
@@ -81,7 +81,7 @@ ocr:
   health-path: /ToolsPage/ReadFile  # ADAPT под реальный эндпоинт
   probe-interval-ms: 5000
   failure-cooldown: 30s
-  max-servers-per-request: 2        # пробуем до 3 серверов, потом задача в повтор
+  max-servers-per-request: 3        # проверка до 3 серверов, потом задача в повтор
   max-in-flight-per-server: 4       # exec.light 30 + exec.heavy 1 = 31 воркер
   # OCR: 8 серверов × 4 слота = 32 слота  → 31 ≤ 32 ✅ сходится
   # LLM: semafor iman.max-concurrent = 8  (ждущие слот OCR-слот НЕ держат) ✅

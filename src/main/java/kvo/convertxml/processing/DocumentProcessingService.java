@@ -3,6 +3,7 @@ package kvo.convertxml.processing;
 import kvo.convertxml.client.ImanDocumentEnricher;
 import kvo.convertxml.client.ImanUnavailableException;
 import kvo.convertxml.client.LlmBadOutputException;
+import kvo.convertxml.client.LlmPermanentException;
 import kvo.convertxml.client.OcrUnavailableException;
 import kvo.convertxml.config.ImanProperties;
 import kvo.convertxml.infra.ClaimHeartbeat;
@@ -11,7 +12,6 @@ import kvo.convertxml.infra.DocumentTaskDao.TaskHeader;
 import kvo.convertxml.infra.InstanceId;
 import kvo.convertxml.parser.OcrSizeLimitException;
 import kvo.convertxml.parser.ParserDispatcher;
-import kvo.convertxml.client.LlmPermanentException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -38,35 +38,47 @@ public class DocumentProcessingService {
     /** Ограничение текста ошибки для записи в БД — защита колонки error от переполнения. */
     private static final int MAX_ERROR_LEN = 500;
 
-    // +++ Порог подряд идущих ДОКУМЕНТ-специфичных сбоев OCR до rejects.
-    // +++ Кейс задачи 31487: битый PDF бесконечно гонялся по ретраям
-    // +++ (markTransient не растит retry_count), каждые ~2 мин штрафуя серверы.
+    /**
+     * Порог подряд идущих сбоев OCR, специфичных для конкретного документа.
+     * Кейс задачи 31487: битый PDF бесконечно гонялся по ретраям
+     * (markTransient не растит retry_count), каждые ~2 мин штрафуя серверы.
+     */
     private final int ocrPoisonRetries;
 
-    // ### ЗОМБИ-КАП: порог подряд ТРАНЗИТНЫХ сбоев ЛЮБОГО рода (poison-счётчик
-    // ### инфра-сбои игнорирует, зомби-счётчик — считает). Кейсы 29927, 85696,
-    // ### 112458…: недели циклов «OCR → завис → transient → повтор», каждый цикл
-    // ### жжёт до max-servers-per-request × ocr.read-timeout серверного времени.
-    private final int zombieTransientRetries;                                    // ###
+    /**
+     * Порог подряд транзитных сбоев любого рода (poison-счётчик инфра-сбои
+     * игнорирует, зомби-счётчик считает). Кейсы 29927, 85696, 112458 и далее:
+     * недели циклов «OCR, завис, transient, повтор», каждый цикл жжёт
+     * server-время, измеряемое произведением числа задействованных серверов
+     * на read-timeout OCR.
+     */
+    private final int zombieTransientRetries;
 
-    // +++ Счётчики подряд документ-специфичных транзитных сбоев по задачам.
-    // +++ POISON-счётчик (count) растёт ТОЛЬКО на документ-специфичных отказах;
-    // +++ инфраструктурные его обнуляют — иначе часовой простой кластера
-    // +++ отправил бы в rejects все задачи.
-    // ### ЗОМБИ-счётчик (anyCount) растёт на любом транзитном сбое, НО обнуляется
-    // ### во время глобального простоя (см. isOutageNow) — защита та же.
+    /**
+     * Счётчики подряд транзитных сбоев по задачам.
+     * <p>
+     * Poison-счётчик наращивается только на отказах, специфичных для конкретного
+     * документа. Инфраструктурный сбой обнуляет серию — иначе часовой простой
+     * кластера отправил бы в rejects все задачи.
+     * <p>
+     * Зомби-счётчик наращивается на любом транзитном сбое, но тоже обнуляется
+     * во время глобального простоя (см. registerTransientFail) — защита та же.
+     */
     private final ConcurrentHashMap<Long, TransientFail> transientFails
             = new ConcurrentHashMap<>();
 
-    /** Через сколько «тишины» по задаче забыть счётчик (защита от утечки памяти). */
+    /** Через сколько тишины по задаче забыть счётчик (защита от утечки памяти). */
     private static final long POISON_EVICT_AFTER_MS = 60L * 60 * 1000;
 
-    // ### Если за это окно НИ ОДНА задача не дошла до терминального успеха —
-    // ### считаем кластер в простое: зомби-счётчики не растут (массовых rejects
-    // ### при полном отказе OCR/LLM не будет — задачи просто ждут, как раньше).
-    private static final long OUTAGE_WINDOW_MS = 10L * 60 * 1000;                // ###
-    /** ### Момент последнего терминального успеха (markDone/markEmpty); 0 — не было. */
-    private volatile long lastSuccessAtMs;                                       // ###
+    /**
+     * Если за это окно ни одна задача не дошла до терминального успеха — считаем
+     * кластер в простое: зомби-счётчики не растут, массовых rejects при полном
+     * отказе OCR/LLM не будет — задачи просто ждут, как раньше.
+     */
+    private static final long OUTAGE_WINDOW_MS = 10L * 60 * 1000;
+
+    /** Момент последнего терминального успеха (markDone или markEmpty); ноль — не было. */
+    private volatile long lastSuccessAtMs;
 
     private final DocumentTaskDao dao;
     private final ParserDispatcher parser;
@@ -87,7 +99,7 @@ public class DocumentProcessingService {
                                      @Value("${app.min-length-xml:20}") int minTextLength,
                                      ClaimHeartbeat heartbeat,
                                      @Value("${app.ocr-poison-retries:5}") int ocrPoisonRetries,
-                                     @Value("${app.zombie-transient-retries:20}") int zombieTransientRetries) { // ###
+                                     @Value("${app.zombie-transient-retries:20}") int zombieTransientRetries) {
         this.dao = dao;
         this.parser = parser;
         this.instanceId = instanceId;
@@ -98,7 +110,7 @@ public class DocumentProcessingService {
         this.minTextLength = minTextLength;
         this.heartbeat = heartbeat;
         this.ocrPoisonRetries = Math.max(2, ocrPoisonRetries);
-        this.zombieTransientRetries = Math.max(10, zombieTransientRetries);      // ###
+        this.zombieTransientRetries = Math.max(10, zombieTransientRetries);
     }
 
     public void process(TaskHeader row, UUID token) {
@@ -116,156 +128,237 @@ public class DocumentProcessingService {
         }
     }
 
+    /** Результат фазы загрузки и парсинга: путь к temp-файлу и тайминги фаз. */
+    private record Parsed(Path txtFile, long loadMs, long parseMs) {}
+
+    /** Тайминги фаз одной задачи — без этого finishTask разрастался до 8–9 параметров. */
+    private record TaskTiming(long loadMs, long parseMs, long imanMs, long started) {}
+
+    /**
+     * Только диспетчеризация: счастливый путь плюс по одному обработчику на класс сбоя.
+     * Вся содержательная логика вынесена в методы ниже.
+     */
     private void execute(TaskHeader row, UUID token, String me) {
-        long t0 = System.nanoTime();
+        final long started = System.nanoTime();
         Path txtFile = null;
         try {
-            long t = System.nanoTime();
-            byte[] source = dao.loadBinary(row.fileId());
-            long loadMs = elapsed(t);
-            t = System.nanoTime();
-            txtFile = parser.parseToText(row.fileName(), source);
-            source = null;                       // отпустить исходник до вызова LLM/записи в БД
-            long parseMs = elapsed(t);
-            // Пустота проверяется по сырому тексту, ДО вызова iman — не тратим LLM-вызов
-            String text = Files.readString(txtFile, StandardCharsets.UTF_8);
-            if (text.isBlank() || text.length() < minTextLength) {
-                boolean marked = dao.markEmptyResult(row.id(), me, token);
-                transientFails.remove(row.id());                                           // терминальный исход
-                clusterAlive();                                                           // ### OCR отработал — кластер жив
-                log.warn("Задача {}: извлечённый текст пуст/короче {} симв. (marked={})",
-                        row.id(), minTextLength, marked);
-                return;
-            }
-            t = System.nanoTime();
-            String header = imanEnabled ? iman.extractHeader(text) : "";
-            long imanMs = elapsed(t);
-            String enriched = header.isEmpty() ? text : header + "\n" + text;
-            boolean saved = dao.markDone(row.id(), me, token, enriched);
-            if (saved) {
-                transientFails.remove(row.id());                                           // терминальный исход
-                clusterAlive();                                                           // ### конвейер жив
-                log.info("Задача {} завершена: load={} мс, parse={} мс, iman={} мс, итог {} мс",
-                        row.id(), loadMs, parseMs, imanMs, elapsed(t0));
-                if (parseMs > 10_000) {
-                    log.warn("Задача {}: медленный parse {} мс: {}",
-                            row.id(), parseMs, row.fileName());
-                }
-            } else {
-                log.warn("Задача {} перехвачена другим инстансом, результат отброшен", row.id());
-            }
+            txtFile = runPipeline(row, token, me, started);
         } catch (OcrSizeLimitException e) {
-            transientFails.remove(row.id());                                               // терминальный исход
-            boolean ok = dao.markRejected(row.id(), me, token, truncate(e.getMessage()));
-            log.warn("Задача {}: отклонена без OCR — {} (rejected={})", row.id(), e.getMessage(), ok);
+            rejectOversized(row, token, me, e);
         } catch (LlmBadOutputException e) {
-            // +++ Ответ LLM детерминированно неисправим (битый XML / обрезан / нет <Document>):
-            // +++ повтор с тем же входом даст то же самое. Засчитываем неудачную попытку
-            // +++ (markFailed растит retry_count) — после app.max-retries задача
-            // +++ остановится в ERROR вместо бесконечного цикла с повторным OCR.
-            // ВАЖНО: transientFails НЕ чистим — иначе чередование «OCR-poison /
-            // LLM-бад» сбрасывало бы счётчик и задача крутилась бы вечно.
-            safeMarkFailed(row.id(), me, token, e);
-            log.warn("Задача {}: неисправимый ответ LLM, засчитана неудачная попытка: {}",
-                    row.id(), truncate(e.getMessage()));
+            countFailedLlmAttempt(row, token, me, e);
         } catch (LlmPermanentException e) {
-            // Конфигурация LLM неверна — повтор бессмыслен. Засчитываем попытку:
-            // после app.max-retries задача остановится в ERROR, а не будет
-            // бесконечно перемалывать OCR. После починки iman.model — вернуть в очередь.
-            safeMarkFailed(row.id(), me, token, e);
-            log.error("Задача {}: ПОСТОЯННАЯ ошибка LLM — {}. Проверьте iman.model / iman.base-url",
-                    row.id(), truncate(e.getMessage()));
+            countFailedLlmConfig(row, token, me, e);
         } catch (ImanUnavailableException | OcrUnavailableException e) {
-            // +++ Poison-детектор: живой OCR-сервис ОТВЕТИЛ, но логически отказал на
-            // +++ этом же файле (IsSuccess=false / InvalidPdfException) N раз подряд —
-            // +++ документ битый, ретраи бессмысленны. Инфра-сбои не считаются:
-            // +++ «нет свободных серверов» — это про кластер, не про документ.
-            TransientFail f = registerTransientFail(row.id(), e.getMessage());            // ### (был int)
-            if (f.count >= ocrPoisonRetries) {
-                transientFails.remove(row.id());
-                boolean ok = dao.markRejected(row.id(), me, token,
-                        truncate("poison-документ: " + e.getMessage()));
-                log.warn("Задача {}: {} подряд документ-специфичных отказов OCR — "
-                                + "документ битый, отклоняем (rejected={}): {}",
-                        row.id(), f.count, ok, truncate(e.getMessage()));
-                return;
-            }
-            // ### ЗОМБИ-КАП: слишком много подряд транзитных сбоев ЛЮБОГО рода без
-            // ### единого успеха, при том что кластер жив (у других задач успехи есть).
-            // ### Каждый такой цикл сжигает слот и до 2 × 360 с серверного времени.
-            // ### REJECTED (retry_count=9999). Реанимация, если ошиблись:
-            // ### UPDATE … SET status=0, retry_count=0 WHERE id=…
-            if (f.anyCount >= zombieTransientRetries) {                                   // ###
-                transientFails.remove(row.id());                                          // ###
-                boolean ok = dao.markRejected(row.id(), me, token, truncate(              // ###
-                        "ZOMBIE: " + f.anyCount + " подряд транзитных сбоев, "           // ###
-                                + "последний: " + e.getMessage()));                       // ###
-                log.warn("Задача {}: ЗОМБИ — {} подряд транзитных сбоев → "               // ###
-                                + "REJECTED (rejected={}): {}",                           // ###
-                        row.id(), f.anyCount, ok, truncate(e.getMessage()));              // ###
-                return;                                                                   // ###
-            }                                                                             // ###
-            int delay = 60 + ThreadLocalRandom.current().nextInt(60);   // 60–120 с
-            requeue(row.id(), token, me, delay, e.getMessage());
+            handleTransientFailure(row, token, me, e);
         } catch (Exception e) {
-            log.error("Ошибка обработки задачи {} за {} мс", row.id(), elapsed(t0), e);
-            // transientFails НЕ чистим: сбой мог случиться после успешного OCR,
-            // счётчик должен дожить до следующей попытки.
+            long totalMs = elapsed(started);
+            log.error("Ошибка обработки задачи {} за {} мс", row.id(), totalMs, e);
+            // Счётчики транзитных сбоев не чистим: сбой мог случиться после
+            // успешного OCR, счётчик должен дожить до следующей попытки.
             safeMarkFailed(row.id(), me, token, e);
         } finally {
-            if (txtFile != null) {
-                try {
-                    Files.deleteIfExists(txtFile);
-                } catch (IOException e) {
-                    log.warn("Не удалось удалить временный файл {}", txtFile, e);
-                }
-            }
-            heartbeat.release(row.id());          // ВСЕГДА — последняя строка, вне if
+            deleteTempFile(txtFile);
+            heartbeat.release(row.id());          // всегда, при любом исходе
+        }
+    }
+
+    /** Счастливый путь: загрузка, парсинг/OCR, опциональная LLM-шапка, DONE.
+     *  Возвращает temp-файл — execute удалит его в finally при любом исходе.
+     *  Неспецифичные сбои (в том числе IOException) пробрасываются в catch (Exception). */
+    private Path runPipeline(TaskHeader row, UUID token, String me, long started) throws IOException {
+        Parsed parsed = loadAndParse(row);
+        // Пустота проверяется по сырому тексту, до вызова iman — не тратим LLM-вызов
+        String text = Files.readString(parsed.txtFile(), StandardCharsets.UTF_8);
+        if (isTextTooShort(text)) {
+            markTooShort(row, token, me);
+            return parsed.txtFile();
+        }
+        long t = System.nanoTime();
+        String header = imanEnabled ? iman.extractHeader(text) : "";
+        long imanMs = elapsed(t);
+        finishTask(row, token, me, header, text,
+                new TaskTiming(parsed.loadMs(), parsed.parseMs(), imanMs, started));
+        return parsed.txtFile();
+    }
+
+    /** Загрузка исходника из БД и парсинг в текстовый temp-файл.
+     *  Байты исходника не нужны после parseToText: локальная переменная источника
+     *  умирает на выходе из метода, ссылка недостижима и GC освободит память
+     *  ещё до вызова LLM — отдельное присваивание null не требуется. */
+    private Parsed loadAndParse(TaskHeader row) {
+        long t = System.nanoTime();
+        byte[] source = dao.loadBinary(row.fileId());
+        long loadMs = elapsed(t);
+        t = System.nanoTime();
+        Path txtFile = parser.parseToText(row.fileName(), source);
+        return new Parsed(txtFile, loadMs, elapsed(t));
+    }
+
+    private boolean isTextTooShort(String text) {
+        return text.isBlank() || text.length() < minTextLength;
+    }
+
+    private void markTooShort(TaskHeader row, UUID token, String me) {
+        boolean marked = dao.markEmptyResult(row.id(), me, token);
+        transientFails.remove(row.id());       // терминальный исход
+        clusterAlive();                        // OCR отработал — кластер жив
+        log.warn("Задача {}: извлечённый текст пуст/короче {} симв. (marked={})",
+                row.id(), minTextLength, marked);
+    }
+
+    private void finishTask(TaskHeader row, UUID token, String me,
+                            String header, String text, TaskTiming tm) {
+        String enriched = header.isEmpty() ? text : header + "\n" + text;
+        boolean saved = dao.markDone(row.id(), me, token, enriched);
+        if (saved) {
+            transientFails.remove(row.id());   // терминальный исход
+            clusterAlive();                    // конвейер жив
+            log.info("Задача {} завершена: load={} мс, parse={} мс, iman={} мс, итог {} мс",
+                    row.id(), tm.loadMs(), tm.parseMs(), tm.imanMs(), elapsed(tm.started()));
+            warnSlowParse(row, tm.parseMs());
+        } else {
+            log.warn("Задача {} перехвачена другим инстансом, результат отброшен", row.id());
+        }
+    }
+
+    private static void warnSlowParse(TaskHeader row, long parseMs) {
+        if (parseMs > 10_000) {
+            log.warn("Задача {}: медленный parse {} мс: {}",
+                    row.id(), parseMs, row.fileName());
+        }
+    }
+
+    /** Файл больше лимита OCR — терминальный REJECTED без распознавания. */
+    private void rejectOversized(TaskHeader row, UUID token, String me, OcrSizeLimitException e) {
+        transientFails.remove(row.id());       // терминальный исход
+        boolean ok = dao.markRejected(row.id(), me, token, truncate(e.getMessage()));
+        log.warn("Задача {}: отклонена без OCR — {} (rejected={})", row.id(), e.getMessage(), ok);
+    }
+
+    /**
+     * Ответ LLM детерминированно неисправим (битый XML, обрезан, нет Document):
+     * повтор с тем же входом даст то же самое. Засчитываем неудачную попытку
+     * (markFailed растит retry_count) — после app.max-retries задача остановится
+     * в ERROR вместо бесконечного цикла с повторным OCR.
+     * <p>
+     * Счётчики транзитных сбоев намеренно не чистим — иначе чередование
+     * «OCR-poison и LLM-бад» сбрасывало бы счётчик, и задача крутилась бы вечно.
+     */
+    private void countFailedLlmAttempt(TaskHeader row, UUID token, String me, LlmBadOutputException e) {
+        safeMarkFailed(row.id(), me, token, e);
+        log.warn("Задача {}: неисправимый ответ LLM, засчитана неудачная попытка: {}",
+                row.id(), e.getMessage());
+    }
+
+    /** Конфигурация LLM неверна — повтор бессмыслен. Засчитываем попытку:
+     *  после app.max-retries задача остановится в ERROR. После починки
+     *  iman.model — вернуть в очередь (status=0, retry_count=0). */
+    private void countFailedLlmConfig(TaskHeader row, UUID token, String me, LlmPermanentException e) {
+        safeMarkFailed(row.id(), me, token, e);
+        log.error("Задача {}: ПОСТОЯННАЯ ошибка LLM — {}. Проверьте iman.model и iman.base-url",
+                row.id(), e.getMessage());
+    }
+
+    /** Poison-детектор, зомби-кап и обычный транзитный возврат в очередь. */
+    private void handleTransientFailure(TaskHeader row, UUID token, String me, RuntimeException e) {
+        TransientFail f = registerTransientFail(row.id(), e.getMessage());
+        if (f.count >= ocrPoisonRetries) {
+            rejectPoisonDocument(row, token, me, e, f.count);
+            return;
+        }
+        if (f.anyCount >= zombieTransientRetries) {
+            rejectZombieTask(row, token, me, e, f.anyCount);
+            return;
+        }
+        requeue(row.id(), token, me, randomDelaySec(), e.getMessage());
+    }
+
+    /** Живой OCR-сервис ответил, но логически отказал на этом же файле N раз
+     *  подряд — документ битый, ретраи бессмысленны. Инфраструктурные сбои
+     *  не считаются: «нет свободных серверов» — это про кластер, не про документ. */
+    private void rejectPoisonDocument(TaskHeader row, UUID token, String me,
+                                      RuntimeException e, int streak) {
+        transientFails.remove(row.id());
+        boolean ok = dao.markRejected(row.id(), me, token,
+                truncate("poison-документ: " + e.getMessage()));
+        log.warn("Задача {}: {} подряд документ-специфичных отказов OCR — "
+                        + "документ битый, отклоняем (rejected={}): {}",
+                row.id(), streak, ok, e.getMessage());
+    }
+
+    /**
+     * Зомби-кап: слишком много подряд транзитных сбоев любого рода без единого
+     * успеха, при том что кластер жив (у других задач успехи есть). Каждый такой
+     * цикл сжигает слот и серверное время, поэтому задача переводится в REJECTED
+     * с максимальным retry_count. Реанимация, если ошиблись:
+     * вернуть status и счётчик попыток в исходные значения командой UPDATE по id.
+     */
+    private void rejectZombieTask(TaskHeader row, UUID token, String me,
+                                  RuntimeException e, int streak) {
+        transientFails.remove(row.id());
+        boolean ok = dao.markRejected(row.id(), me, token, truncate(
+                "ZOMBIE: " + streak + " подряд транзитных сбоев, последний: " + e.getMessage()));
+        log.warn("Задача {}: ЗОМБИ — {} подряд транзитных сбоев → REJECTED (rejected={}): {}",
+                row.id(), streak, ok, e.getMessage());
+    }
+
+    private static int randomDelaySec() {
+        return 60 + ThreadLocalRandom.current().nextInt(60);   // 60–120 с
+    }
+
+    private static void deleteTempFile(Path txtFile) {
+        if (txtFile == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(txtFile);
+        } catch (IOException e) {
+            log.warn("Не удалось удалить временный файл {}", txtFile, e);
         }
     }
 
     // +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    // +++ Poison-детектор + зомби-кап
+    // Poison-детектор и зомби-кап
     // +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
     /**
      * Зафиксировать транзитный сбой и вернуть текущие счётчики по задаче.
-     * POISON-счётчик (count): растёт только на документ-специфичных отказах,
-     * инфраструктурный сбой его обнуляет (как и раньше).
-     * ЗОМБИ-счётчик (anyCount): растёт на любом транзитном сбое, но обнуляется,
-     * если кластер в глобальном простое (за окно OUTAGE_WINDOW_MS ни одного
-     * терминального успеха) — полный отказ инфраструктуры не должен рассылать
-     * задачи в rejects.
-     * Точное сравнение текста ошибки не подходит: имя сервера в сообщении меняется
-     * от попытки к попытке (round-robin), а суть — нет.
+     * Poison-счётчик наращивается только на документ-специфичных отказах,
+     * инфраструктурный сбой обнуляет серию. Зомби-счётчик наращивается на любом
+     * транзитном сбое, но обнуляется, если кластер в глобальном простое (за окно
+     * OUTAGE_WINDOW_MS ни одного терминального успеха) — полный отказ
+     * инфраструктуры не должен рассылать задачи в rejects.
+     * <p>
+     * Точное сравнение текста ошибки не подходит: имя сервера в сообщении
+     * меняется от попытки к попытке (round-robin), а суть — нет.
      */
-    private TransientFail registerTransientFail(long id, String error) {                  // ### (был int)
-        boolean docSpecific = looksDocumentSpecific(error);                               // ###
-        boolean outage = System.currentTimeMillis() - lastSuccessAtMs > OUTAGE_WINDOW_MS; // ###
-        TransientFail f = transientFails.compute(id, (k, prev) -> {
+    private TransientFail registerTransientFail(long id, String error) {
+        boolean docSpecific = looksDocumentSpecific(error);
+        boolean outage = System.currentTimeMillis() - lastSuccessAtMs > OUTAGE_WINDOW_MS;
+        return transientFails.compute(id, (k, prev) -> {
             if (prev == null) {
-                return new TransientFail(docSpecific, outage);                            // ###
+                return new TransientFail(docSpecific, outage);
             }
             if (docSpecific) {
                 prev.count++;               // poison: подряд документ-специфичных
             } else {
                 prev.count = 0;             // poison: инфра-сбой рвёт серию
             }
-            prev.anyCount = outage ? 0 : prev.anyCount + 1;                               // ###
+            prev.anyCount = outage ? 0 : prev.anyCount + 1;
             prev.lastAt = System.currentTimeMillis();
             return prev;
         });
-        return f;
     }
 
-    /** ### Конвейер довёл задачу до терминального успеха — кластер жив. */
-    private void clusterAlive() {                                                         // ###
-        lastSuccessAtMs = System.currentTimeMillis();                                     // ###
-    }                                                                                     // ###
+    /** Конвейер довёл задачу до терминального успеха — кластер жив. */
+    private void clusterAlive() {
+        lastSuccessAtMs = System.currentTimeMillis();
+    }
 
     /**
-     * Ошибка зависит от ДОКУМЕНТА, а не от инфраструктуры: живой OCR-сервис
-     * ответил логическим отказом на этот файл (конверт IsSuccess=false
+     * Ошибка зависит от документа, а не от инфраструктуры: живой OCR-сервис
+     * ответил логическим отказом на этот файл (конверт вернул неуспех
      * с деталями неудачного парсинга PDF).
      */
     private static boolean looksDocumentSpecific(String error) {
@@ -275,7 +368,7 @@ public class DocumentProcessingService {
                 || error.contains("Rebuild failed"));
     }
 
-    /** Гигиена карты: раз в 10 мин выбрасывать счётчики, «тихие» более часа. */
+    /** Гигиена карты: раз в 10 минут выбрасывать счётчики, тихие более часа. */
     @Scheduled(fixedDelayString = "${app.poison-evict-ms:600000}")
     void evictStaleTransientFails() {
         long cutoff = System.currentTimeMillis() - POISON_EVICT_AFTER_MS;
@@ -284,14 +377,14 @@ public class DocumentProcessingService {
 
     /** Счётчик подряд идущих транзитных сбоев по задаче. */
     private static final class TransientFail {
-        int count = 1;              // +++ подряд ДОКУМЕНТ-специфичных (poison)
-        int anyCount = 1;           // ### подряд транзитных ЛЮБОГО рода (зомби-кап)
+        int count = 1;              // подряд документ-специфичных (poison)
+        int anyCount = 1;           // подряд транзитных любого рода (зомби-кап)
         volatile long lastAt = System.currentTimeMillis();
 
-        TransientFail(boolean docSpecific, boolean outage) {                             // ###
-            this.count = docSpecific ? 1 : 0;                                            // ###
-            this.anyCount = outage ? 0 : 1;                                              // ###
-        }                                                                                 // ###
+        TransientFail(boolean docSpecific, boolean outage) {
+            this.count = docSpecific ? 1 : 0;
+            this.anyCount = outage ? 0 : 1;
+        }
     }
 
     /** Транзитный сбой: вернуть задачу в очередь с паузой delaySec, без роста retry_count. */
@@ -318,6 +411,7 @@ public class DocumentProcessingService {
         }
     }
 
+    /** Обрезка для записи в БД (колонка error ограничена). В логах не используется. */
     private static String truncate(String s) {
         if (s == null) {
             return "";

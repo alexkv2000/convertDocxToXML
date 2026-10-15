@@ -3,6 +3,11 @@ rem set IMAN_ACCESS_TOKEN=sk-8e8be9398ad34062900766c732b5f72e
 rem $env:IMAN_REFRESH_TOKEN = "долговременный_ключ"
 rem C:\Java\jdk-17\bin\java.exe -Xmx6g -jar docx-to-xml-service-1.1.0.jar --spring.config.location=file:.\application.yml
 
+rem POWERSHELL
+rem $env:IMAN_ACCESS_TOKEN="sk-8e8be9398ad34062900766c732b5f72e"
+rem $env:DB_PASSWORD="DV_Cthdbc14@"
+rem C:\Java\jdk-17\bin\java.exe -Xmx6g -jar C:\Users\KvochkinAY\IdeaProjects\Spring\Project\convertDocxToXML\target\docx-to-xml-service-1.1.1.jar --spring.config.location=file:C:\Users\KvochkinAY\IdeaProjects\Spring\Project\convertDocxToXML\src\main\resources\application.yml
+
 rem процессы  java из PowerShell
 rem Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Select-Object ProcessId,CommandLine
 
@@ -137,3 +142,60 @@ rem   "temperature": 0.1,
 rem   "max_tokens": 10000,
 rem   "stream": false
 rem }
+
+rem чтение лога
+rem Select-String C:\svc\docx-processor\logs\application.log -Pattern 'ПЕРЕГРУЗКА'
+rem Select-String C:\svc\docx-processor\logs\application.log -Pattern 'документ битый|poison'
+rem Select-String C:\svc\docx-processor\logs\application.log -Pattern 'OCR-кластер' | Select-Object -Last 8
+
+rem ## Снимок с момента рестарта + живой монитор
+rem >> [Console]::OutputEncoding = [Text.Encoding]::UTF8
+rem >> $log  = 'C:\svc\docx-processor\logs\application.log'
+rem >> $tail = 'C:\svc\restart.log'
+rem >> $t0   = [datetime]'2026-09-28 08:19'    # первая строка рестарта — 08:19:28
+rem >>
+rem >> # --- отрезать лог от момента рестарта (ИЗМЕНЕНО: защита от $null) ---
+rem >> $st = Select-String -Path $log -Pattern 'Started .* in \d+|JVM running' | Select-Object -Last 1
+rem >> if ($st) {
+rem >>   "строка старта найдена, строка $($st.LineNumber)"
+rem >>   Get-Content $log -Encoding UTF8 | Select-Object -Skip ($st.LineNumber - 1) |
+rem >>     Set-Content $tail -Encoding UTF8
+rem >> } else {
+rem >>   "строки старта нет — лог уже начинается с рестарта, беру весь файл"
+rem >>   Copy-Item $log $tail -Force
+rem >> }
+rem >>
+rem >> # --- снимок ---
+rem >> $succ = Select-String -Path $tail -Pattern 'ответ за (\d+) мс'
+rem >> $lat  = $succ | ForEach-Object { [int]$_.Matches[0].Groups[1].Value }
+rem >> $rej  = (Select-String -Path $tail -Pattern 'marked=true').Count
+rem >> $to   = (Select-String -Path $tail -Pattern 'timed out|timeout').Count
+rem >> $err  = (Select-String -Path $tail -Pattern 'ERROR|Exception').Count
+rem >> $hrs  = ((Get-Date) - $t0).TotalHours
+rem >> "прошло {0:n1} ч | успехов {1} (~{2:n0}/ч) | отбраковок {3} (~{4:n0}/ч) | таймаутов {5} | ошибок {6}" -f `
+rem >>   $hrs, $lat.Count, ($lat.Count/$hrs), $rej, ($rej/$hrs), $to, $err
+rem >> if ($lat.Count -ge 10) {
+rem >>   $s = $lat | Sort-Object
+rem >>   "латентность мс: медиана {0:n0} | p95 {1:n0} | max {2:n0}" -f `
+rem >>     $s[[int]($s.Count*0.5)], $s[[int]($s.Count*0.95)], $s[-1]
+rem >> }
+rem >>
+rem >> # --- темп по минутам (ИЗМЕНЕНО: последние 30 минут, чтобы не мельтешило) ---
+rem >> $succ | ForEach-Object { ($_.Line -replace '.*(\d{2}:\d{2}):\d{2}.*','$1') } |
+rem >>   Group-Object | Sort-Object Name | Select-Object -Last 30 |
+rem >>   Format-Table Name, Count -AutoSize
+rem >>
+rem >> # --- живой монитор ---
+rem >> $prevC = $null; $prevR = $null
+rem >> while ($true) {
+rem >>   $c = (Select-String -Path $log -Pattern 'ответ за'    | Measure-Object).Count
+rem >>   $r = (Select-String -Path $log -Pattern 'marked=true' | Measure-Object).Count
+rem >>   if ($null -eq $prevC) { "{0}  базовая линия: успехов {1}, отбраковок {2}" -f (Get-Date -Format HH:mm:ss), $c, $r }
+rem >>   else { "{0}  +{1} отв/мин | +{2} отбрак/мин | всего успехов {3}, отбрак {4}" -f (Get-Date -Format HH:mm:ss), ($c-$prevC), ($r-$prevR), $c, $r }
+rem >>   $prevC = $c; $prevR = $r; Start-Sleep 60
+rem >> }
+
+
+rem проверка доступности сервера CDV
+rem Invoke-WebRequest -UseBasicParsing -Method Post `
+rem >>   -Uri "http://doc-app7:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b/ToolsPage/ReadFile"

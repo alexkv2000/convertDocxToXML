@@ -47,9 +47,9 @@ public class ImanDocumentEnricher {
     private static final Pattern BARE_AMP = Pattern.compile(
             "&(?!(amp|lt|gt|quot|apos|#\\d+|#x[0-9a-fA-F]+);)");
 
-    // +++ Cap параллельных запросов к LLM: 16–25 одновременных запросов (по числу
-    // +++ doc-workers) перегружают провайдера — ответы деградируют до 115–125 с,
-    // +++ затем 502-шторм. Семафор держит давление постоянным.
+    // Cap параллельных запросов к LLM: 16–25 одновременных запросов (по числу
+    // doc-workers) перегружают провайдера — ответы деградируют до 115–125 с,
+    // затем 502-шторм. Семафор держит давление постоянным.
     private final Semaphore llmSlots;
     private final int llmMaxConcurrent;
     /** Сколько воркер ждёт слот, прежде чем уйти в транзитный повтор. */
@@ -90,11 +90,11 @@ public class ImanDocumentEnricher {
         this.llmSlots = new Semaphore(llmMaxConcurrent);
         this.slotWaitMs = Math.max(1_000, slotWaitMs);
         this.slowResponseMs = slowResponseMs > 0 ? slowResponseMs : 30_000L;
-        // +++ Гарантированные дополнения к системному промпту из app.prompt:
-        // +++ 1) экранирование спецсимволов XML (лечит сырой & в ответах);
-        // +++ 2) /no_think — Qwen3 не тратит лимит completion на «размышления»
-        // +++    (именно это давало обрезку по max_tokens=10000).
-        // +++ Для не-Qwen моделей это безвредный текст в конце инструкции.
+        // Гарантированные дополнения к системному промпту из app.prompt:
+        // 1) экранирование спецсимволов XML (лечит сырые ответы)
+        // 2) /no_think — Qwen3 не тратит лимит completion на «размышления»
+        //    (именно это давало обрезку по max_tokens=10000).
+        // Для не-Qwen моделей это безвредный текст в конце инструкции.
         this.prompt = prompt.strip()
                 + "\n\nСпецсимволы &, <, > в текстовых значениях тегов экранируй: &amp; &lt; &gt;."
                 + "\nВыводи только итоговый XML, без пояснений и размышлений."
@@ -153,10 +153,10 @@ public class ImanDocumentEnricher {
     }
 
     /** Возвращает заполненную XML-шапку <Document>...</Document>. Транзитные сбои LLM повторяем.
-     *  +++ LlmBadOutputException сквозь цикл НЕ ловится: ответ детерминированно битый,
-     *  +++ повтор с тем же входом даст тот же результат — уходим сразу.
-     *  +++ Слот семафора берётся ПОПЫТКОЙ (внутри attemptExtract): backoff-сон между
-     *  +++ попытками не держит слот впустую. */
+     *  LlmBadOutputException сквозь цикл НЕ ловится: ответ детерминированно битый,
+     *  повтор с тем же входом даст тот же результат — уходим сразу.
+     *  Слот семафора берётся ПОПЫТКОЙ (внутри attemptExtract): backoff-сон между
+     *  попытками не держит слот впустую. */
     public String extractHeader(String fullDocumentText) {
         final int maxAttempts = props.maxAttempts();
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -251,9 +251,8 @@ public class ImanDocumentEnricher {
                     .body(JsonNode.class);
         } catch (ResourceAccessException e) {        // таймаут/обрыв/DNS — не отвечает
             llm.failure();
-            // Таймаут LLM — ТРАНЗИТНЫЙ сбой, не сбой задачи. Раньше улетал
-            // в catch(Exception) сервиса и делал markFailed (путь в ERROR).
-            // Обёртка включает и ретрай-цикл extractHeader, и requeue сервиса.
+            // Таймаут LLM — ТРАНЗИТНЫЙ сбой, не сбой задачи.
+            // Обёртка включает и ретрай-цикл extractHeader, и requeue сервиса
             throw new ImanUnavailableException(                                    // +++
                     "LLM: таймаут/сеть — " + abbreviate(e.getMessage(), 160), e);   // +++
         }
@@ -263,8 +262,8 @@ public class ImanDocumentEnricher {
     private void handleLlmError(String token, HttpStatusCode status) {
         int code = status.value();
         if (code == 401 || code == 403) {
-            // токен мог протухнуть — обновляем и повторяем запрос.
-            // Прошёл refresh — транзитный сбой, пауза не нужна.
+            // токен мог протухнуть — обновляем и повторяем запрос
+            // Прошёл refresh — транзитный сбой, пауза не нужна
             if (tokens.refreshIfStale(token)) {
                 throw new ImanUnavailableException("LLM HTTP " + code
                         + ": access_token обновлён, повторяем с новым");
@@ -287,7 +286,7 @@ public class ImanDocumentEnricher {
     }
 
     /** Автопочинка: дособирает пропущенные закрывающие теги и оборванный хвост.
-     *  null — если дефект сложнее (лишний закрывающий и т.п.), не берёмся. */
+     * Null — если дефект сложнее (лишний закрывающий и т.п.), не берёмся. */
     private String tryRepair(String xml) {
         List<TagFix> fixes = new ArrayList<>();
         Deque<String> open = new ArrayDeque<>();
