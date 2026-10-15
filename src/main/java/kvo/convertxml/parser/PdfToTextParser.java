@@ -68,14 +68,19 @@ public class PdfToTextParser {
                 log.info("PDF без текстового слоя, распознаём через OCR: {}", fileName);
                 String ocrText = ocr.extractText(fileName, pdfBytes);
                 Files.writeString(tmp, ocrText, StandardCharsets.UTF_8);
+                if (ocrText.isBlank()) {
+                    // Раньше пустой файл уезжал в markEmptyResult (status=3,
+                    // retry_count+1) и гонял МИНУТНОЕ распознавание повторно.
+                    throw new OcrEmptyTextException("OCR: текст не распознан "
+                            + "(0 символов) — вероятно, пустой или чёрный скан: "
+                            + fileName);
+                }
                 log.info("OCR {}: распознано {} символов", fileName, ocrText.length());
             }
             return tmp;
-        } catch (OcrSizeLimitException | ImanUnavailableException | OcrUnavailableException e) {
+        } catch (OcrSizeLimitException | OcrEmptyTextException
+                 | ImanUnavailableException | OcrUnavailableException e) {
             deleteQuietly(tmp);
-            // Пробрасываем как есть — диспетчеризация по типу выше, в DocumentProcessingService:
-            //   OcrSizeLimitException         -> dao.markRejected(...), терминальный отказ без retry
-            //   Iman/OcrUnavailableException  -> транзитный сбой, задача уйдёт на повтор
             throw e;
         } catch (Exception e) {
             deleteQuietly(tmp);

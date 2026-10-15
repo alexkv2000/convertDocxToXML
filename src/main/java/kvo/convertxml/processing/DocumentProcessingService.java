@@ -10,6 +10,7 @@ import kvo.convertxml.infra.ClaimHeartbeat;
 import kvo.convertxml.infra.DocumentTaskDao;
 import kvo.convertxml.infra.DocumentTaskDao.TaskHeader;
 import kvo.convertxml.infra.InstanceId;
+import kvo.convertxml.parser.OcrEmptyTextException;
 import kvo.convertxml.parser.OcrSizeLimitException;
 import kvo.convertxml.parser.ParserDispatcher;
 import org.slf4j.Logger;
@@ -151,6 +152,10 @@ public class DocumentProcessingService {
             countFailedLlmConfig(row, token, me, e);
         } catch (ImanUnavailableException | OcrUnavailableException e) {
             handleTransientFailure(row, token, me, e);
+        } catch (OcrEmptyTextException e) {                                          // +++
+            rejectEmptyOcr(row, token, me, e);                                       // +++
+        } catch (IllegalArgumentException e) {                                       // +++
+            rejectBadFormat(row, token, me, e);                                      // +++
         } catch (Exception e) {
             long totalMs = elapsed(started);
             log.error("Ошибка обработки задачи {} за {} мс", row.id(), totalMs, e);
@@ -162,7 +167,21 @@ public class DocumentProcessingService {
             heartbeat.release(row.id());          // всегда, при любом исходе
         }
     }
-
+    /** Формат исходника не опознан — детерминированная ошибка документа.
+     *  Сразу REJECTED, без двух ERROR-итераций со стектрейсом. */
+    private void rejectBadFormat(TaskHeader row, UUID token, String me,              // +++
+                                 IllegalArgumentException e) {                       // +++
+        transientFails.remove(row.id());                                             // +++
+        boolean ok = dao.markRejected(row.id(), me, token, truncate(e.getMessage())); // +++
+        log.warn("Задача {}: неподдерживаемый/повреждённый исходник — {} "           // +++
+                + "(rejected={})", row.id(), e.getMessage(), ok);                    // +++
+    }
+    private void rejectEmptyOcr(TaskHeader row, UUID token, String me,
+                                OcrEmptyTextException e) {                           // +++
+        transientFails.remove(row.id());                                             // +++
+        boolean ok = dao.markRejected(row.id(), me, token, truncate(e.getMessage())); // +++
+        log.warn("Задача {}: {} (rejected={})", row.id(), e.getMessage(), ok);       // +++
+    }
     /** Счастливый путь: загрузка, парсинг/OCR, опциональная LLM-шапка, DONE.
      *  Возвращает temp-файл — execute удалит его в finally при любом исходе.
      *  Неспецифичные сбои (в том числе IOException) пробрасываются в catch (Exception). */

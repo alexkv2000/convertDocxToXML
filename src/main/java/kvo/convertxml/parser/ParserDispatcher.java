@@ -27,7 +27,20 @@ public class ParserDispatcher {
             case RTF, HTML -> throw new IllegalArgumentException(
                     "Файл «" + fileName + "» содержит " + fmt + ", а не Word/PDF — конвертируйте в .doc/.docx/.pdf");
             case UNKNOWN -> throw new IllegalArgumentException(
-                    "Не удалось определить формат файла: " + fileName);
+                    "Не удалось определить формат файла: " + fileName
+                            + " — размер " + (bytes == null ? 0 : bytes.length)
+                            + " байт, сигнатура " + headHex(bytes));
         };
+    }
+    /** Первые байты файла в hex — видно, что на самом деле лежит в «.pdf». */
+    private static String headHex(byte[] b) {
+        if (b == null || b.length == 0) return "нет (файл пустой)";
+        int n = Math.min(8, b.length);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            if (i > 0) sb.append(' ');
+            sb.append(String.format("%02X", b[i]));
+        }
+        return sb + "…";
     }
 }

@@ -58,7 +58,7 @@ iman:
   connect-timeout: 10s
   read-timeout: 180s         # было "5m"
   max-text-chars: 40000      # чтобы ответы не обрезались по max_tokens=10000 - 100000
-  max-attempts: 3      # попыток на задачу, можно увеличит до "3"
+  max-attempts: 1      # попыток на задачу, можно увеличит до "3"
   retry-backoff: 2s    # пауза 2с, 4с перед повторами
 logging:
   file:
