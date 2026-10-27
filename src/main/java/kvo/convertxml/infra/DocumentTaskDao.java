@@ -85,10 +85,21 @@ public class DocumentTaskDao {
             WHERE f.FileID = ?
             """;
 
+    // +++ Кэш распознанного текста: ретраи (битый XML от LLM, таймаут LLM)
+    // +++ идут сразу в LLM, минуя повторный 5–17-минутный OCR.
+    private static final String SQL_LOAD_PARSED_TEXT = """      
+            SELECT parsed_text FROM dbo.doc_documents WITH (NOLOCK) WHERE id = ? 
+            """;
+
+    private static final String SQL_SAVE_PARSED_TEXT = """      
+            UPDATE dbo.doc_documents SET parsed_text = ? WHERE id = ?
+            """;
+
     private static final String SQL_DONE_RELEASE = """
             UPDATE dbo.doc_documents
                SET status = 2, error_message = NULL,
                    locked_by = NULL, locked_at = NULL, claim_token = NULL,
+                   parsed_text = NULL,                 -- +++ терминальный исход — кэш больше не нужен
                    updated_at = SYSUTCDATETIME()
              WHERE id = ? AND locked_by = ? AND claim_token = ?
             """;
@@ -103,6 +114,8 @@ public class DocumentTaskDao {
             DELETE FROM dbo.doc_results WHERE doc_id = ?
             """;
     private static final String SQL_MARK_FAILED = """
+            -- parsed_text СОЗНАТЕЛЬНО не чистим: markFailed = ретрай (невалидный XML и т.п.),
+            -- повтор должен взять текст из кэша и НЕ перемалывать OCR заново.
             UPDATE dbo.doc_documents
                SET status = 3, error_message = ?,
                    retry_count = retry_count + 1,
@@ -115,11 +128,14 @@ public class DocumentTaskDao {
                    error_message = N'Извлечённый текст пуст',
                    retry_count = 9999,   -- + терминально: пустой скан не изменится при повторе,
                                          -- + раньше гонял распознавание ещё max-retries раз
+                   parsed_text = NULL,   -- +++ терминальный исход — кэш чистим
                    locked_by = NULL, locked_at = NULL, claim_token = NULL,
                    updated_at = SYSUTCDATETIME()
              WHERE id = ? AND locked_by = ? AND claim_token = ?
             """;
     private static final String SQL_MARK_TRANSIENT = """
+            -- parsed_text СОЗНАТЕЛЬНО не чистим: транзитный сбой = ретрай,
+            -- если сбой случился уже после OCR — повтор берёт текст из кэша.
             UPDATE dbo.doc_documents
                SET status = 0,
                    next_attempt_at = DATEADD(SECOND, ?, SYSUTCDATETIME()),
@@ -137,6 +153,7 @@ public class DocumentTaskDao {
             UPDATE dbo.doc_documents
                SET status = 3, error_message = ?,
                    retry_count = 9999,               -- выше любого max-retries: повторов не будет
+                   parsed_text = NULL,               -- +++ терминальный исход — кэш чистим
                    locked_by = NULL, locked_at = NULL, claim_token = NULL,
                    updated_at = SYSUTCDATETIME()
              WHERE id = ? AND locked_by = ? AND claim_token = ?
@@ -238,6 +255,21 @@ public class DocumentTaskDao {
     public byte[] loadBinary(String fileId) {
         return jdbc.queryForObject(SQL_LOAD_BINARY, byte[].class, fileId);
     }
+
+    /**
+     * +++ Кэш распознанного текста задачи; null — кэша нет, нужен полный парсинг.
+     */
+    public String loadParsedText(long id) {                                        // +++
+        List<String> rows = jdbc.queryForList(SQL_LOAD_PARSED_TEXT, String.class, id); // +++
+        return rows.isEmpty() ? null : rows.get(0);                                // +++
+    }                                                                              // +++
+
+    /**
+     * +++ Сохранить текст после успешного parse — ретраи LLM пойдут без повторного OCR.
+     */
+    public void saveParsedText(long id, String text) {                             // +++
+        jdbc.update(SQL_SAVE_PARSED_TEXT, text, id);                               // +++
+    }                                                                              // +++
 
     /**
      * Фиксация результата в ОДНОЙ транзакции: статус DONE в очереди +

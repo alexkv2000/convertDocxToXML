@@ -152,10 +152,10 @@ public class DocumentProcessingService {
             countFailedLlmConfig(row, token, me, e);
         } catch (ImanUnavailableException | OcrUnavailableException e) {
             handleTransientFailure(row, token, me, e);
-        } catch (OcrEmptyTextException e) {                                          // +++
-            rejectEmptyOcr(row, token, me, e);                                       // +++
-        } catch (IllegalArgumentException e) {                                       // +++
-            rejectBadFormat(row, token, me, e);                                      // +++
+        } catch (OcrEmptyTextException e) {
+            rejectEmptyOcr(row, token, me, e);
+        } catch (IllegalArgumentException e) {
+            rejectBadFormat(row, token, me, e);
         } catch (Exception e) {
             long totalMs = elapsed(started);
             log.error("Ошибка обработки задачи {} за {} мс", row.id(), totalMs, e);
@@ -167,21 +167,24 @@ public class DocumentProcessingService {
             heartbeat.release(row.id());          // всегда, при любом исходе
         }
     }
+
     /** Формат исходника не опознан — детерминированная ошибка документа.
      *  Сразу REJECTED, без двух ERROR-итераций со стектрейсом. */
-    private void rejectBadFormat(TaskHeader row, UUID token, String me,              // +++
-                                 IllegalArgumentException e) {                       // +++
-        transientFails.remove(row.id());                                             // +++
-        boolean ok = dao.markRejected(row.id(), me, token, truncate(e.getMessage())); // +++
-        log.warn("Задача {}: неподдерживаемый/повреждённый исходник — {} "           // +++
-                + "(rejected={})", row.id(), e.getMessage(), ok);                    // +++
+    private void rejectBadFormat(TaskHeader row, UUID token, String me,
+                                 IllegalArgumentException e) {
+        transientFails.remove(row.id());
+        boolean ok = dao.markRejected(row.id(), me, token, truncate(e.getMessage()));
+        log.warn("Задача {}: неподдерживаемый/повреждённый исходник — {} "
+                + "(rejected={})", row.id(), e.getMessage(), ok);
     }
+
     private void rejectEmptyOcr(TaskHeader row, UUID token, String me,
-                                OcrEmptyTextException e) {                           // +++
-        transientFails.remove(row.id());                                             // +++
-        boolean ok = dao.markRejected(row.id(), me, token, truncate(e.getMessage())); // +++
-        log.warn("Задача {}: {} (rejected={})", row.id(), e.getMessage(), ok);       // +++
+                                OcrEmptyTextException e) {
+        transientFails.remove(row.id());
+        boolean ok = dao.markRejected(row.id(), me, token, truncate(e.getMessage()));
+        log.warn("Задача {}: {} (rejected={})", row.id(), e.getMessage(), ok);
     }
+
     /** Счастливый путь: загрузка, парсинг/OCR, опциональная LLM-шапка, DONE.
      *  Возвращает temp-файл — execute удалит его в finally при любом исходе.
      *  Неспецифичные сбои (в том числе IOException) пробрасываются в catch (Exception). */
@@ -201,18 +204,66 @@ public class DocumentProcessingService {
         return parsed.txtFile();
     }
 
-    /** Загрузка исходника из БД и парсинг в текстовый temp-файл.
-     *  Байты исходника не нужны после parseToText: локальная переменная источника
-     *  умирает на выходе из метода, ссылка недостижима и GC освободит память
-     *  ещё до вызова LLM — отдельное присваивание null не требуется. */
+    /**
+     * Загрузка исходника и парсинг в текстовый temp-файл — С КЭШЕМ по задаче.   // +++
+     * <p>                                                                       // +++
+     * После успешного parse (для сканов внутри — OCR на 5–17 минут серверного   // +++
+     * времени) текст сохраняется в doc_documents.parsed_text. Повтор задачи —   // +++
+     * невалидный XML от LLM (markFailed), таймаут LLM (markTransient) — берёт   // +++
+     * текст из кэша и идёт сразу в LLM, БЕЗ повторного OCR.                     // +++
+     * <p>                                                                       // +++
+     * Кэш чистится только в терминальных исходах (DONE / пустой текст /         // +++
+     * REJECTED — см. SQL в DocumentTaskDao), поэтому таблица не распухает.      // +++
+     * <p>                                                                       // +++
+     * Байты исходника не нужны после parseToText: локальная переменная источника// +++
+     * умирает на выходе из метода, ссылка недостижима и GC освободит память     // +++
+     * ещё до вызова LLM — отдельное присваивание null не требуется.             // +++
+     */
     private Parsed loadAndParse(TaskHeader row) {
         long t = System.nanoTime();
+        String cached = dao.loadParsedText(row.id());                            // +++
+        if (cached != null) {                                                    // +++
+            Path fromCache = writeTempText(cached);                              // +++
+            long loadMs = elapsed(t);                                            // +++
+            log.info("Задача {}: текст из кэша ({} симв., {} мс) — "             // +++
+                    + "парсинг/OCR пропущены", row.id(), cached.length(), loadMs); // +++
+            return new Parsed(fromCache, loadMs, 0);                             // +++
+        }                                                                        // +++
         byte[] source = dao.loadBinary(row.fileId());
         long loadMs = elapsed(t);
         t = System.nanoTime();
         Path txtFile = parser.parseToText(row.fileName(), source);
-        return new Parsed(txtFile, loadMs, elapsed(t));
+        long parseMs = elapsed(t);                                               // +++
+        saveParsedTextQuietly(row.id(), txtFile);                                // +++
+        return new Parsed(txtFile, loadMs, parseMs);                             // +++
     }
+
+    /**
+     * +++ Кэш → temp-файл: дальнейший конвейер (LLM) работает с файлом, как раньше.
+     */
+    private Path writeTempText(String text) {                                    // +++
+        try {                                                                    // +++
+            Path tmp = Files.createTempFile("doctext-", ".txt");                 // +++
+            Files.writeString(tmp, text, StandardCharsets.UTF_8);                // +++
+            return tmp;                                                          // +++
+        } catch (IOException e) {                                                // +++
+            throw new IllegalStateException(                                     // +++
+                    "Не удалось создать temp-файл из кэша текста", e);           // +++
+        }                                                                        // +++
+    }                                                                            // +++
+
+    /**
+     * +++ Кэширование — best effort: сбой записи кэша не должен валить          // +++
+     * +++ уже сделанную работу; худший случай — повтор честно перепарсит.
+     */    // +++
+    private void saveParsedTextQuietly(long id, Path txtFile) {                  // +++
+        try {                                                                    // +++
+            dao.saveParsedText(id, Files.readString(txtFile, StandardCharsets.UTF_8)); // +++
+        } catch (Exception e) {                                                  // +++
+            log.warn("Задача {}: кэш текста не сохранён — повтор повторит "      // +++
+                    + "парсинг ({})", id, e.getMessage());                       // +++
+        }                                                                        // +++
+    }                                                                            // +++
 
     private boolean isTextTooShort(String text) {
         return text.isBlank() || text.length() < minTextLength;

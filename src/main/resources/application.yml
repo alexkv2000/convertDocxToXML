@@ -28,8 +28,8 @@ app:
   ocr-max-mb: 6                 # максимальный размер файла для парсинга (5Mb)
   ocr-poison-retries: 3         # документ-специфичный отказ OCR (есть)
   zombie-transient-retries: 10  # подряд транзитных сбоев ЛЮБОГО рода → REJECTED
-  prompt : | 
-    Ты получаешь текст документа. Выполни шаги : 1. Выбери из текста названия всех юр. лиц (организация-автор и контрагенты), их ИНН и КПП, если присутствуют. 2. Определи Вид документа (классификация, принятая в системах ЭДО). 3. Заполни XML-структуру по шаблону ниже данными из текста; заполни все теги, если данных нет — оставь тег пустым. 4. Выведи мне ТОЛЬКО XML без стороннего текста и без markdown. Шаблон:<Document><Header><DocumentType></DocumentType><RelatedDocument></RelatedDocument><Date></Date><Number></Number><OrderDate></OrderDate><OrderNumber></OrderNumber><CopyNumber></CopyNumber><Summa></Summa><NDS></NDS><Currency></Currency></Header><Parties><Company><Country></Country><Name></Name><Role></Role><Address></Address><INN></INN><Phone></Phone><SignatoryCompany></SignatoryCompany></Company><Counterparties><Counterparty><Country></Country><Name></Name><Address></Address><INN></INN><Phones><Phone></Phone></Phones><SignatoryCounterparty></SignatoryCounterparty></Counterparty></Counterparties></Parties></Document> Текст документа
+  prompt : |
+    Ты получаешь текст документа. Выполни шаги : 1. Выбери из текста названия всех юр. лиц (организация-автор и контрагенты), их ИНН и КПП, если присутствуют. 2. Определи Вид документа (классификация, принятая в системах ЭДО). 3. Заполни XML-структуру по шаблону ниже данными из текста; заполни все теги, если данных нет — оставь тег пустым. 4. Выведи мне ТОЛЬКО XML без стороннего текста и без markdown. Шаблон:<Document><Header><DocumentType></DocumentType><RelatedDocument></RelatedDocument><Date></Date><Number></Number><OrderDate></OrderDate><OrderNumber></OrderNumber><CopyNumber></CopyNumber><Summa></Summa><NDS></NDS><Currency></Currency></Header><Parties><Company><Country></Country><Name></Name><Role></Role><Address></Address><INN></INN><Phone></Phone><SignatoryCompany></SignatoryCompany></Company><Counterparties><Counterparty><Country></Country><Name></Name><Address></Address><INN></INN><Phones><Phone></Phone></Phones><SignatoryCounterparty></SignatoryCounterparty></Counterparty></Counterparties></Parties></Document> Имена тегов выводи с точным соблюдением регистра. Дату заказа выводи строго как <OrderDate>ДД.ММ.ГГГГ</OrderDate>, без атрибутов. Текст документа:
   exec:
     light:
       core: 20                  # лёгкий пул (обычные файлы) default - 30
@@ -88,7 +88,7 @@ ocr:
   # (31 воркеров / 8 серверов ≈ 3-4; 0 = без лимита)
   # Для OCR: 6 серверов × 4 слота = 24 слота ≥ 21 воркер (20 light + 1 heavy) — ок
   connect-timeout: 10s    # 5 секунд
-  read-timeout: 360s      # многостраничные сканы могут распознаваться долго
+  read-timeout: 25m      # многостраничные сканы могут распознаваться долго было 360s
   # url: http://doc-app8:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b/ToolsPage/ReadFile
   # max-attempts: 2
   # retry-backoff: 10s
