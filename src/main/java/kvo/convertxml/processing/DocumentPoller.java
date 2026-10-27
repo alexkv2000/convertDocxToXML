@@ -48,7 +48,6 @@ public class DocumentPoller {
                           DocumentProcessingService service,
                           InstanceId instanceId,
                           @Qualifier("docWorkers") ThreadPoolTaskExecutor docWorkers,
-                          @Value("${app.exec.light.core:4}") int workerThreads,
                           @Value("${app.batch-size:5}") int batchSize,
                           @Value("${app.stale-timeout-sec:900}") int staleTimeoutSec,
                           @Value("${app.max-retries:3}") int maxRetries,
@@ -63,7 +62,9 @@ public class DocumentPoller {
         this.staleTimeoutSec = staleTimeoutSec;
         this.maxRetries = maxRetries;
         this.retryDelaySec = retryDelaySec;
-        this.inFlight = new Semaphore(workerThreads);
+        // +++ Размер семафора — из фактического максимума пула, а не из дублирующей
+        // +++ проперти app.exec.light.core (дефолт 4 при пуле на 25 → 21 поток простаивал).
+        this.inFlight = new Semaphore(Math.max(1, docWorkers.getMaxPoolSize()));
         this.llm = llm;
         this.enricher = enricher;
     }
@@ -139,13 +140,18 @@ public class DocumentPoller {
                     claims.size(), headers.size(), missing.size());
         }
         log.info("[{}] захвачено задач: {}", instanceId.get(), headers.size());
-        for (TaskHeader header : headers) {
+        for (int i = 0; i < headers.size(); i++) {
+            TaskHeader header = headers.get(i);
             UUID token = tokens.get(header.id());
             try {
                 inFlight.acquire();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                requeueQuietly(header.id(), token, 10);
+                // +++ Возвращаем ВСЁ оставшееся (текущая включена): раньше хвост пачки
+                // +++ числился status=1 и ждал stale-тайм-аут
+                for (TaskHeader h : headers.subList(i, headers.size())) {
+                    requeueQuietly(h.id(), tokens.get(h.id()), 10);
+                }
                 return;
             }
             try {

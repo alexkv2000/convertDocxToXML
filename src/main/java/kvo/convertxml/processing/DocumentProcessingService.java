@@ -99,7 +99,7 @@ public class DocumentProcessingService {
                                      ImanProperties imanProps,
                                      @Value("${app.min-length-xml:20}") int minTextLength,
                                      ClaimHeartbeat heartbeat,
-                                     @Value("${app.ocr-poison-retries:5}") int ocrPoisonRetries,
+                                     @Value("${app.ocr-poison-retries:3}") int ocrPoisonRetries,
                                      @Value("${app.zombie-transient-retries:20}") int zombieTransientRetries) {
         this.dao = dao;
         this.parser = parser;
@@ -290,7 +290,7 @@ public class DocumentProcessingService {
             rejectZombieTask(row, token, me, e, f.anyCount);
             return;
         }
-        requeue(row.id(), token, me, randomDelaySec(), e.getMessage());
+        requeue(row.id(), token, me, backoffDelaySec(f.anyCount), e.getMessage());
     }
 
     /** Живой OCR-сервис ответил, но логически отказал на этом же файле N раз
@@ -322,8 +322,14 @@ public class DocumentProcessingService {
                 row.id(), streak, ok, e.getMessage());
     }
 
-    private static int randomDelaySec() {
-        return 60 + ThreadLocalRandom.current().nextInt(60);   // 60–120 с
+    /** Экспоненциальный backoff с джиттером (50–100 % расчётной задержки):
+     *  серия 1 → 30–60 с, 3 → 76–153 с, 6 → 5–10 мин, 9+ → 7.5–15 мин (потолок 15 мин).
+     *  Фиксированные 60–120 с при 20 воркерах давали синхронный ретрай-шторм:
+     *  все разом возвращались в очередь и одним залпом били в уцелевшие серверы
+     *  (в логе — три одновременных сбоя doc-app7 от воркеров 16/14/13 в одну мс). */
+    private static int backoffDelaySec(int streak) {
+        int exp = (int) Math.min(900, 60 * Math.pow(1.6, Math.max(0, streak - 1)));
+        return exp / 2 + ThreadLocalRandom.current().nextInt(exp / 2 + 1);
     }
 
     private static void deleteTempFile(Path txtFile) {

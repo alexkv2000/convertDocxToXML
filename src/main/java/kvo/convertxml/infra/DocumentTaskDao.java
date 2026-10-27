@@ -52,7 +52,14 @@ public class DocumentTaskDao {
                    OR (status = 3 AND retry_count < ?
                            AND updated_at IS NOT NULL
                            AND updated_at < DATEADD(SECOND, -?, SYSUTCDATETIME()))
-                ORDER BY CASE WHEN status = 1 THEN 0 WHEN status = 0 THEN 1 ELSE 2 END, id
+                ORDER BY
+                    CASE WHEN status = 1 THEN 0        -- восстановление зависших — первыми
+                         WHEN status = 0 THEN 1        -- новые/перая очередь
+                         ELSE 2 END,                   -- ретраи ERROR — в последнюю очередь
+                    created_at DESC,                   -- + свежие документы вперёд:
+                                                       -- + остатки в хвост не голодает
+                                                       -- + и не забивает воркеров в пиковые часы
+                    id
             )
             UPDATE d
                SET d.status = 1, d.locked_by = ?, d.locked_at = SYSUTCDATETIME(),
@@ -106,11 +113,10 @@ public class DocumentTaskDao {
             UPDATE dbo.doc_documents
                SET status = 3,
                    error_message = N'Извлечённый текст пуст',
-                   retry_count = retry_count + 1,   -- иначе claimBatch перезахватит по retry-ветке
-                   locked_by = NULL,
-                   locked_at = NULL,
-                   claim_token = NULL,
-                   updated_at = SYSUTCDATETIME()    -- пауза retry-delay перед повтором
+                   retry_count = 9999,   -- + терминально: пустой скан не изменится при повторе,
+                                         -- + раньше гонял распознавание ещё max-retries раз
+                   locked_by = NULL, locked_at = NULL, claim_token = NULL,
+                   updated_at = SYSUTCDATETIME()
              WHERE id = ? AND locked_by = ? AND claim_token = ?
             """;
     private static final String SQL_MARK_TRANSIENT = """
@@ -122,7 +128,7 @@ public class DocumentTaskDao {
              WHERE id = ? AND locked_by = ? AND claim_token = ?
             """;
     private static final String SQL_HEARTBEAT = """
-            UPDATE d SET d.locked_at = SYSUTCDATETIME(), d.updated_at = SYSUTCDATETIME()
+            UPDATE d SET d.locked_at = SYSUTCDATETIME()   -- +++ updated_at не трогаем: батч-пульс раз в 5 мин затирать времена попыток
             FROM dbo.doc_documents AS d
             JOIN (VALUES %s) AS v(id, tok) ON v.id = d.id AND v.tok = d.claim_token
             WHERE d.locked_by = ? AND d.status = 1

@@ -242,8 +242,11 @@ public class ImanDocumentEnricher {
                         String err = new String(res.getBody().readAllBytes(), StandardCharsets.UTF_8);
                         // 401/403/429 обрабатываются в handleLlmError; прочие 4xx — ошибка (модель/URL/размер), повтор не поможет
                         if (status.is4xxClientError()) {
-                            throw new LlmPermanentException("LLM HTTP " + status + ": "
-                                    + abbreviate(err)
+                            if (err.contains("Server Connection Error") || err.contains("Bad Gateway")) {
+                                throw new ImanUnavailableException(
+                                        "LLM HTTP " + status + " (шлюз временно недоступен): " + abbreviate(err));
+                            }
+                            throw new LlmPermanentException("LLM HTTP " + status + ": " + abbreviate(err)
                                     + " — проверьте iman.model и iman.base-url");
                         }
                         throw new ImanUnavailableException("LLM HTTP " + status + ": " + abbreviate(err));

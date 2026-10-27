@@ -191,13 +191,37 @@ public class OcrRouter {
             throw new OcrServiceException("JSON без конверта IsSuccess/Notes/Data: " + abbreviate(t));
         }
         if (!root.get("IsSuccess").asBoolean()) {
-            throw new OcrServiceException("IsSuccess=false — "
-                    + abbreviate(root.path("Notes").asText("")));
+            String notes = abbreviate(root.path("Notes").asText(""));
+            // +++ Документ-специфичный отказ (iTextSharp не смог разобрать ЭТОТ файл):
+            // +++ вина документа, а не сервера. Сервер жив и корректен — штраф НЕ ставим,
+            // +++ остальные серверы НЕ дёргаем (отказ детерминирован, каждый следующий
+            // +++ вернёт то же). Раньше один битый PDF последовательно штрафовал
+            // +++ app6→app7→app8 и устраивал кластерные окна недоступности.
+            if (isDocumentParseFailure(notes)) {
+                throw new OcrDocumentException("OCR: IsSuccess=false, файл повреждён — " + notes);
+            }
+            throw new OcrServiceException("IsSuccess=false — " + notes);
         }
         // Контракт ReadFile: при успехе текст — в Notes; пустой → сработает проверка «короче 20 симв.»
         return root.path("Notes").asText("");
     }
-
+    private static boolean isDocumentParseFailure(String notes) {
+        return notes.contains("InvalidPdfException")
+                || notes.contains("Rebuild failed")
+                || notes.contains("PDF header")
+                || notes.contains("Startxref")
+                || notes.contains("not a PDF");
+    }
+    /** Отказ OCR, зависящий от конкретного документа (битый/обрезанный PDF).
+     *  Расширяет OcrUnavailableException → автоматически попадает в транзитную ветку
+     *  DocumentProcessingService, где poison-счётчик после app.ocr-poison-retries
+     *  попыток переведёт задачу в REJECTED. Отличие от OcrServiceException:
+     *  сервер НЕ штрафуется и другие серверы НЕ опрашиваются. */
+    static final class OcrDocumentException extends OcrUnavailableException {
+        OcrDocumentException(String message) {
+            super(message);
+        }
+    }
     /** Сжать стек-трейс/мусор до одной строки для лога и исключений. */
     private static String abbreviate(String s) {
         String t = s.replaceAll("\\s+", " ").trim();
