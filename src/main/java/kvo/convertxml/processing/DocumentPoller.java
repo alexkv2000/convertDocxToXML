@@ -62,8 +62,8 @@ public class DocumentPoller {
         this.staleTimeoutSec = staleTimeoutSec;
         this.maxRetries = maxRetries;
         this.retryDelaySec = retryDelaySec;
-        // +++ Размер семафора — из фактического максимума пула, а не из дублирующей
-        // +++ проперти app.exec.light.core (дефолт 4 при пуле на 25 → 21 поток простаивал).
+        // Размер семафора — из фактического максимума пула, а не из дублирующей
+        // проперти app.exec.light.core (дефолт 4 при пуле на 25 → 21 поток простаивал).
         this.inFlight = new Semaphore(Math.max(1, docWorkers.getMaxPoolSize()));
         this.llm = llm;
         this.enricher = enricher;
@@ -88,16 +88,11 @@ public class DocumentPoller {
             log.error("Ошибка загрузки новых задач", e);
         }
     }
-    private void probeLlm() {
-        if (!llm.shouldProbe()) return;            // не чаще раза в минуту
-        try {
-            enricher.ping();                       // таймаут 10 с, не 180
-            llm.success();                         // внутри отлогируется «возобновляем»
-        } catch (Exception e) {
-            log.warn("LLM не отвечает на пробу ({}), продолжаем ждать", e.getMessage());
-            llm.failure();                         // продлевает паузу
-        }
-    }
+
+    /**
+     * Оркестратор опроса: только порядок фаз, вся логика — в методах ниже.
+     * Guard-клаузы вместо вложенных веток.
+     */
     @Scheduled(fixedDelayString = "${app.poll-interval-ms:5000}")
     public void poll() {
         if (llm.isPaused()) {
@@ -106,74 +101,133 @@ public class DocumentPoller {
         }
         int available = inFlight.availablePermits();
         if (available <= 0) {
+            return;                              // все воркеры заняты
+        }
+        List<DocumentTaskDao.Claim> claims = claimUpTo(available);
+        if (claims.isEmpty()) {
+            return;                              // ошибка БД (залогирована) или брать нечего
+        }
+        Map<Long, UUID> tokens = tokensOf(claims);
+        List<TaskHeader> headers;
+        try {
+            headers = dao.headersFor(idsOf(claims));
+        } catch (Exception e) {
+            // Чтение упало: вся пачка — в очередь с паузой, terminator-ветка
+            // (failMissing) не должна выполняться для транзитного сбоя БД
+            log.error("Ошибка чтения заголовков для {} задач — возвращаем в очередь",
+                    claims.size(), e);
+            claims.forEach(c -> requeueQuietly(c.id(), c.token(), 60));
             return;
         }
-        List<DocumentTaskDao.Claim> claims;
+        markMissingSources(claims, headers);     // пустой headers = «источники удалены», это ок
+        log.info("[{}] захвачено задач: {}", instanceId.get(), headers.size());
+        dispatch(headers, tokens);
+    }
+
+    private void probeLlm() {
+        if (!llm.shouldProbe()) {
+            return;                              // не чаще раза в минуту
+        }
         try {
-            claims = dao.claimBatch(instanceId.get(), Math.min(batchSize, available),
+            enricher.ping();                     // таймаут 10 с, не 180
+            llm.success();                       // внутри отлогируется «возобновляем»
+        } catch (Exception e) {
+            log.warn("LLM не отвечает на пробу ({}), продолжаем ждать", e.getMessage());
+            llm.failure();                       // продлевает паузу
+        }
+    }
+
+    /** Захват пачки; при ошибке БД возвращает пустой список (ошибка уже залогирована). */
+    private List<DocumentTaskDao.Claim> claimUpTo(int available) {
+        try {
+            return dao.claimBatch(instanceId.get(), Math.min(batchSize, available),
                     staleTimeoutSec, maxRetries, retryDelaySec);
         } catch (Exception e) {
             log.error("Ошибка захвата задач", e);
+            return List.of();
+        }
+    }
+
+    /** Захвачено больше, чем найдено заголовков — исходники удалены из DocsVision. */
+    private void markMissingSources(List<DocumentTaskDao.Claim> claims, List<TaskHeader> headers) {
+        if (headers.size() == claims.size()) {
             return;
         }
-        if (claims.isEmpty()) {
-            return;
-        }
-        Map<Long, UUID> tokens = claims.stream()
-                .collect(Collectors.toMap(DocumentTaskDao.Claim::id, DocumentTaskDao.Claim::token));
-        List<TaskHeader> headers;
-        try {
-            headers = dao.headersFor(claims.stream().map(DocumentTaskDao.Claim::id).toList());
-        } catch (Exception e) {
-            log.error("Ошибка чтения заголовков для {} задач — возвращаем в очередь", claims.size(), e);
-            for (DocumentTaskDao.Claim c : claims) {
-                requeueQuietly(c.id(), c.token(), 60);
-            }
-            return;
-        }
-        if (headers.size() != claims.size()) {
-            Set<Long> found = headers.stream().map(TaskHeader::id).collect(Collectors.toSet());
-            List<DocumentTaskDao.Claim> missing = claims.stream()
-                    .filter(c -> !found.contains(c.id())).toList();
-            dao.failMissing(instanceId.get(), missing);
-            log.warn("Захвачено {}, заголовков {} — {} задач без исходника помечены (status=3)",
-                    claims.size(), headers.size(), missing.size());
-        }
-        log.info("[{}] захвачено задач: {}", instanceId.get(), headers.size());
+        Set<Long> found = headers.stream().map(TaskHeader::id).collect(Collectors.toSet());
+        List<DocumentTaskDao.Claim> missing = claims.stream()
+                .filter(c -> !found.contains(c.id())).toList();
+        dao.failMissing(instanceId.get(), missing);
+        log.warn("Захвачено {}, заголовков {} — {} задач без исходника помечены (status=3)",
+                claims.size(), headers.size(), missing.size());
+    }
+
+    /**
+     * Постановка в пул по одной задаче на слот семафора.
+     * Прерывание потока шедулера: текущая задача и весь хвост пачки возвращаются
+     * в очередь (раньше хвост числился status=1 и ждал stale-таймаут).
+     */
+    private void dispatch(List<TaskHeader> headers, Map<Long, UUID> tokens) {
         for (int i = 0; i < headers.size(); i++) {
             TaskHeader header = headers.get(i);
             UUID token = tokens.get(header.id());
-            try {
-                inFlight.acquire();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                // +++ Возвращаем ВСЁ оставшееся (текущая включена): раньше хвост пачки
-                // +++ числился status=1 и ждал stale-тайм-аут
-                for (TaskHeader h : headers.subList(i, headers.size())) {
-                    requeueQuietly(h.id(), tokens.get(h.id()), 10);
-                }
+            if (!acquireSlot()) {
+                requeueQuietly(header.id(), token, 10);
+                requeueTail(headers, tokens, i + 1);
                 return;
             }
-            try {
-                workers.execute(() -> {
-                    try {
-                        service.process(header, token);
-                    } finally {
-                        inFlight.release();
-                    }
-                });
-            } catch (RuntimeException e) {
-                inFlight.release();
-                requeueQuietly(header.id(), token, 10);
-                log.error("Задача {} не поставлена в пул — возвращена в очередь", header.id(), e);
-            }
+            submit(header, token);
         }
     }
+
+    /** false — ожидание слота прервано (флаг interrupt восстановлен). */
+    private boolean acquireSlot() {
+        try {
+            inFlight.acquire();
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /** Задача в пул; отказ пула не смертелен — задача возвращается в очередь. */
+    private void submit(TaskHeader header, UUID token) {
+        try {
+            workers.execute(() -> {
+                try {
+                    service.process(header, token);
+                } finally {
+                    inFlight.release();
+                }
+            });
+        } catch (RuntimeException e) {
+            inFlight.release();
+            requeueQuietly(header.id(), token, 10);
+            log.error("Задача {} не поставлена в пул — возвращена в очередь", header.id(), e);
+        }
+    }
+
+    /** Хвост незадиспетченной пачки — в очередь с короткой паузой. */
+    private void requeueTail(List<TaskHeader> headers, Map<Long, UUID> tokens, int from) {
+        for (TaskHeader h : headers.subList(from, headers.size())) {
+            requeueQuietly(h.id(), tokens.get(h.id()), 10);
+        }
+    }
+
     private void requeueQuietly(long id, UUID token, int delaySec) {
         try {
             dao.markTransient(id, instanceId.get(), token, delaySec);
         } catch (Exception e) {
             log.error("Не удалось вернуть задачу {} в очередь — подберёт stale-таймаут", id, e);
         }
+    }
+
+    private static List<Long> idsOf(List<DocumentTaskDao.Claim> claims) {
+        return claims.stream().map(DocumentTaskDao.Claim::id).toList();
+    }
+
+    private static Map<Long, UUID> tokensOf(List<DocumentTaskDao.Claim> claims) {
+        return claims.stream()
+                .collect(Collectors.toMap(DocumentTaskDao.Claim::id, DocumentTaskDao.Claim::token));
     }
 }
