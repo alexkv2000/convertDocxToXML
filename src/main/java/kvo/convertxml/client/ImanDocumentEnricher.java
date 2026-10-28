@@ -184,6 +184,7 @@ public class ImanDocumentEnricher {
             // +++ Нет слота за iman.slot-wait-ms — транзитный сбой, задача в повтор.
             acquired = llmSlots.tryAcquire(slotWaitMs, TimeUnit.MILLISECONDS);
             if (!acquired) {
+                llm.failure();
                 throw new ImanUnavailableException("LLM: нет свободного слота за "
                         + slotWaitMs + " мс (лимит " + llmMaxConcurrent
                         + ", свободно " + llmSlots.availablePermits() + ")");
@@ -243,6 +244,7 @@ public class ImanDocumentEnricher {
                         // 401/403/429 обрабатываются в handleLlmError; прочие 4xx — ошибка (модель/URL/размер), повтор не поможет
                         if (status.is4xxClientError()) {
                             if (err.contains("Server Connection Error") || err.contains("Bad Gateway")) {
+                                llm.failure();   // ошибка 400 = LLM лежит; 3 подряд — пауза опроса
                                 throw new ImanUnavailableException(
                                         "LLM HTTP " + status + " (шлюз временно недоступен): " + abbreviate(err));
                             }
@@ -321,7 +323,10 @@ public class ImanDocumentEnricher {
         if (!open.contains(t.name())) {
             return false;                    // закрывающий без пары
         }
-        while (!open.peek().equals(t.name())) {   // пропущен </...> — дособрать
+        // contains(t.name()) выше гарантирует, что t.name() лежит в стеке — цикл
+        // остановится ровно на нём, стек не исчерпается. isEmpty и обратный порядок
+        // equals — явная страховка: peek() nullable, t.name() — нет.
+        while (!open.isEmpty() && !t.name().equals(open.peek())) {   // пропущен </...> — дособрать
             fixes.add(new TagFix(t.start(), "</" + open.pop() + ">"));
         }
         open.pop();
