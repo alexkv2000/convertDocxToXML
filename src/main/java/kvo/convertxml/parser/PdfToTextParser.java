@@ -57,6 +57,15 @@ public class PdfToTextParser {
                     writeParagraphs(lines, out);
                 }
                 scanned = isBlank(tmp);
+            } catch (IOException pdfBox) {                                          // ###
+                // PDFBox не смог открыть/разобрать файл (битый trailer, page tree).
+                // OCR-сервис тянет собственный парсер (iTextSharp умеет Rebuild) —
+                // отдаём файл ему, не хороним задачу на этапе текст-слоя.
+                // Если и OCR не справится: IsSuccess=false → OcrDocumentException →
+                // poison-кап переведёт задачу в REJECTED после N попыток.
+                log.warn("PDFBox не разобрал {} ({}); пробуем OCR напрямую",          // ###
+                        fileName, pdfBox.getMessage());                               // ###
+                scanned = true;                                                       // ###
             }
             // PDFBox закрыт ДО OCR: не держим документ в памяти на время распознавания.
             if (scanned) {

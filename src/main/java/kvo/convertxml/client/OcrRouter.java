@@ -1,6 +1,7 @@
 package kvo.convertxml.client;
 
 import jakarta.annotation.PostConstruct;
+import kvo.convertxml.metrics.ServiceMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
@@ -31,6 +32,9 @@ import java.util.Base64;
  * все заняты/недоступны — OcrUnavailableException, задача уходит на повтор.
  * Два вида штрафа: транспортный (снимается зелёной пробой) и логический
  * (IsSuccess=false при живом сервисе — пробой НЕ снимается, истекает по времени).
+ *
+ * Метрики в Grafana: docx_ocr_server_up{server}, docx_ocr_servers_available,
+ * docx_ocr_requests_total{server,outcome}, docx_ocr_duration_seconds{server}.
  */
 @Component
 public class OcrRouter {
@@ -41,13 +45,14 @@ public class OcrRouter {
     private static final JsonMapper JSON = JsonMapper.builder().build();
 
     private final OcrProperties props;
+    private final ServiceMetrics metrics;                               // +++
     private final RestClient ocrClient;       // долгий read-timeout — сам OCR
     private final RestClient healthClient;    // короткие таймауты — пробы живости
     private final List<Server> servers;
     private final AtomicInteger cursor = new AtomicInteger();
     private int probeRounds;                  // для периодической сводки (один @Scheduled-поток)
 
-    public OcrRouter(OcrProperties props) {
+    public OcrRouter(OcrProperties props, ServiceMetrics metrics) {
         if (props.servers().isEmpty()) {
             throw new IllegalStateException(
                     "ocr.servers пуст — укажите адреса doc-app…doc-app8 в application.yml");
@@ -56,6 +61,7 @@ public class OcrRouter {
             validateServer(url);
         }
         this.props = props;
+        this.metrics = metrics;
         // HTTP/1.1 (как у iman-клиента): без мультиплексирования, мёртвое соединение
         // выбрасывается, следующий запрос открывает новое
         JdkClientHttpRequestFactory ocrFactory = new JdkClientHttpRequestFactory(
@@ -80,6 +86,10 @@ public class OcrRouter {
             list.add(new Server(shortName(trimmed), trimmed));
         }
         this.servers = List.copyOf(list);
+        for (Server s : this.servers) {
+            metrics.ocrRegisterServer(s.name, s.inFlight, s::isReady);
+            metrics.ocrPreregisterServer(s.name);   // серии с нулями сразу после старта
+        }
     }
 
     /** Стартовый опрос — ротация сразу начинается с живых серверов. */
@@ -102,21 +112,37 @@ public class OcrRouter {
             idx++;
             if (tryAcquire(s)) {
                 attempts++;
+                long t0 = System.nanoTime();                            // +++
                 try {
                     String text = callOcr(s, fileName, pdf);
+                    metrics.ocrRequest(s.name, "success", elapsedMs(t0)); // +++
                     return text == null ? "" : text;
                 } catch (ResourceAccessException e) {      // коннект/таймаут — сервер не отвечает
+                    metrics.ocrRequest(s.name, "transport_error", elapsedMs(t0)); // +++
                     lastError = punish(s, "нет ответа: " + e.getMessage());
                 } catch (RestClientResponseException e) {  // 4xx/5xx от сервиса
+                    metrics.ocrRequest(s.name, "http_error", elapsedMs(t0));      // +++
                     lastError = punish(s, "HTTP " + e.getStatusCode().value());
+                } catch (OcrDocumentException e) {         // вина документа, не сервера
+                    metrics.ocrRequest(s.name, "document_error", elapsedMs(t0));  // +++
+                    throw e;   // сервер НЕ штрафуем, другие серверы НЕ дёргаем
                 } catch (OcrServiceException e) {          // жив, но ответил отказом (IsSuccess=false)
+                    metrics.ocrRequest(s.name, "service_refusal", elapsedMs(t0)); // +++
                     lastError = punishLogical(s, e.getMessage());
                 } finally {
                     s.release();
                 }
             }
         }
+        metrics.ocrNoServer();                                           // +++
         throw noServer(lastError);
+    }
+
+    /**
+     * +++ Наносекунды → миллисекунды.
+     */
+    private static long elapsedMs(long fromNanos) {
+        return (System.nanoTime() - fromNanos) / 1_000_000;
     }
 
     private static void validateServer(String url) {
@@ -192,11 +218,11 @@ public class OcrRouter {
         }
         if (!root.get("IsSuccess").asBoolean()) {
             String notes = abbreviate(root.path("Notes").asText(""));
-            // +++ Документ-специфичный отказ (iTextSharp не смог разобрать ЭТОТ файл):
-            // +++ вина документа, а не сервера. Сервер жив и корректен — штраф НЕ ставим,
-            // +++ остальные серверы НЕ дёргаем (отказ детерминирован, каждый следующий
-            // +++ вернёт то же). Раньше один битый PDF последовательно штрафовал
-            // +++ app6→app7→app8 и устраивал кластерные окна недоступности.
+            // Документ-специфичный отказ (iTextSharp не смог разобрать ЭТОТ файл):
+            // вина документа, а не сервера. Сервер жив и корректен — штраф НЕ ставим,
+            // остальные серверы НЕ дёргаем (отказ детерминирован, каждый следующий
+            // вернёт то же). Раньше один битый PDF последовательно штрафовал
+            // app6→app7→app8 и устраивал кластерные окна недоступности.
             if (isDocumentParseFailure(notes)) {
                 throw new OcrDocumentException("OCR: IsSuccess=false, файл повреждён — " + notes);
             }
@@ -205,6 +231,7 @@ public class OcrRouter {
         // Контракт ReadFile: при успехе текст — в Notes; пустой → сработает проверка «короче 20 симв.»
         return root.path("Notes").asText("");
     }
+
     private static boolean isDocumentParseFailure(String notes) {
         return notes.contains("InvalidPdfException")
                 || notes.contains("Rebuild failed")
@@ -212,6 +239,7 @@ public class OcrRouter {
                 || notes.contains("Startxref")
                 || notes.contains("not a PDF");
     }
+
     /** Отказ OCR, зависящий от конкретного документа (битый/обрезанный PDF).
      *  Расширяет OcrUnavailableException → автоматически попадает в транзитную ветку
      *  DocumentProcessingService, где poison-счётчик после app.ocr-poison-retries
@@ -222,6 +250,7 @@ public class OcrRouter {
             super(message);
         }
     }
+
     /** Сжать стек-трейс/мусор до одной строки для лога и исключений. */
     private static String abbreviate(String s) {
         String t = s.replaceAll("\\s+", " ").trim();
@@ -273,6 +302,7 @@ public class OcrRouter {
         for (Server s : servers) {
             probe(s);
         }
+        metrics.ocrAvailable(servers.stream().filter(s -> !s.penalized()).count()); // +++
         probeRounds++;
         if (probeRounds % 12 == 0) {           // раз в минуту — сводка по кластеру
             String snapshot = statusSnapshot();
@@ -360,6 +390,13 @@ public class OcrRouter {
         boolean penalized() {
             long now = System.currentTimeMillis();
             return now < transportPenalizedUntil || now < logicalPenalizedUntil;
+        }
+
+        /**
+         * +++ Участвует ли в ротации прямо сейчас (для gauge docx_ocr_server_up).
+         */
+        boolean isReady() {
+            return !penalized();
         }
 
         void clearTransportPenalty() {

@@ -1,6 +1,7 @@
 package kvo.convertxml.client;
 
 import kvo.convertxml.config.ImanProperties;
+import kvo.convertxml.metrics.ServiceMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -21,9 +22,9 @@ import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.Semaphore;                             // +++ cap параллелизма LLM
-import java.util.concurrent.TimeUnit;                                // +++
-import java.util.regex.Pattern;                                      // +++ экранирование «голых» &
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 @Component
 public class ImanDocumentEnricher {
@@ -32,6 +33,7 @@ public class ImanDocumentEnricher {
     private final LlmAvailability llm;
     private final ImanTokenHolder tokens;              // живой access_token + авто-refresh
     private final RestClient pingClient;
+    private final ServiceMetrics metrics;              // +++ метрики LLM для Grafana
     // Имена полей OpenAI-совместимого /chat/completions
     private static final String KEY_ERROR = "error";
     private static final String KEY_MESSAGE = "message";
@@ -42,8 +44,8 @@ public class ImanDocumentEnricher {
     private static final String DOC_OPEN = "<Document>";
     private static final String DOC_CLOSE = "</Document>";
 
-    // +++ «Голый» амперсанд (не часть корректной сущности) — самая частая причина
-    // +++ битого XML от модели ("The entity name must immediately follow the '&'").
+    // «Голый» амперсанд (не часть корректной сущности) — самая частая причина
+    // битого XML от модели ("The entity name must immediately follow the '&'").
     private static final Pattern BARE_AMP = Pattern.compile(
             "&(?!(amp|lt|gt|quot|apos|#\\d+|#x[0-9a-fA-F]+);)");
 
@@ -74,6 +76,7 @@ public class ImanDocumentEnricher {
     }
 
     public ImanDocumentEnricher(ImanProperties props,
+                                ServiceMetrics metrics,
                                 LlmAvailability llm,
                                 ImanTokenHolder tokens,
                                 @Value("${app.prompt}") String prompt,
@@ -84,6 +87,7 @@ public class ImanDocumentEnricher {
             throw new IllegalStateException("app.prompt не задан (application.yml) — промпт обязателен");
         }
         this.props = props;
+        this.metrics = metrics;
         this.llm = llm;
         this.tokens = tokens;
         this.llmMaxConcurrent = Math.max(1, maxConcurrent);
@@ -180,10 +184,11 @@ public class ImanDocumentEnricher {
         }
         boolean acquired = false;
         try {
-            // +++ Не более iman.max-concurrent запросов к LLM одновременно.
-            // +++ Нет слота за iman.slot-wait-ms — транзитный сбой, задача в повтор.
+            // Не более iman.max-concurrent запросов к LLM одновременно.
+            // Нет слота за iman.slot-wait-ms — транзитный сбой, задача в повтор.
             acquired = llmSlots.tryAcquire(slotWaitMs, TimeUnit.MILLISECONDS);
             if (!acquired) {
+                metrics.llmRequestError("no_slot");                                  // +++
                 llm.failure();
                 throw new ImanUnavailableException("LLM: нет свободного слота за "
                         + slotWaitMs + " мс (лимит " + llmMaxConcurrent
@@ -192,10 +197,21 @@ public class ImanDocumentEnricher {
             Map<String, Object> body = buildRequest(truncate(fullDocumentText));
             long started = System.currentTimeMillis();
             final String token = tokens.current();          // токен момента запроса
-            JsonNode response = requestCompletion(body, token);
+            metrics.llmInFlightStart();                     // +++ gauge docx_llm_in_flight
+            JsonNode response;
+            try {
+                response = requestCompletion(body, token);
+            } finally {
+                metrics.llmInFlightEnd();                   // +++
+            }
             llm.success();                                  // HTTP 200 получен — эндпоинт жив
             Completion c = parseCompletion(response);
-            logCompletion(c, System.currentTimeMillis() - started);
+            long elapsedMs = System.currentTimeMillis() - started;
+            logCompletion(c, elapsedMs);
+            metrics.llmSuccess(elapsedMs, c.promptTokens(), c.completionTokens());   // +++
+            if (elapsedMs >= slowResponseMs) {
+                metrics.llmSlow();                          // +++ ранний сигнал перегрузки
+            }
             warnIfTruncated(c);
             String xml = extractXml(c.content());
             return validateOrRepair(xml);
@@ -217,8 +233,8 @@ public class ImanDocumentEnricher {
         int completionTokens = c.completionTokens();
         log.info("LLM {}: ответ за {} мс, finish_reason={}, tokens prompt/completion: {}/{}",
                 model, elapsedMs, finishReason, promptTokens, completionTokens);
-        // +++ Ранний сигнал перегрузки: ответы 115–125 с предшествовали 502-шторму.
-        // +++ Грепабельно: "LLM ПЕРЕГРУЗКА".
+        // Ранний сигнал перегрузки: ответы 115–125 с предшествовали 502-шторму.
+        // Грепабельно: "LLM ПЕРЕГРУЗКА".
         if (elapsedMs >= slowResponseMs) {
             log.warn("LLM ПЕРЕГРУЗКА: ответ {} мс при пороге {} мс; "
                             + "свободно слотов {}/{}",
@@ -244,22 +260,27 @@ public class ImanDocumentEnricher {
                         // 401/403/429 обрабатываются в handleLlmError; прочие 4xx — ошибка (модель/URL/размер), повтор не поможет
                         if (status.is4xxClientError()) {
                             if (err.contains("Server Connection Error") || err.contains("Bad Gateway")) {
+                                metrics.llmRequestError("server_error");            // +++
                                 llm.failure();   // ошибка 400 = LLM лежит; 3 подряд — пауза опроса
                                 throw new ImanUnavailableException(
                                         "LLM HTTP " + status + " (шлюз временно недоступен): " + abbreviate(err));
                             }
+                            metrics.llmRequestError("client_error");                // +++
                             throw new LlmPermanentException("LLM HTTP " + status + ": " + abbreviate(err)
                                     + " — проверьте iman.model и iman.base-url");
                         }
+                        metrics.llmRequestError(status.is5xxServerError() || status.value() == 429 // +++
+                                ? "server_error" : "client_error");                 // +++
                         throw new ImanUnavailableException("LLM HTTP " + status + ": " + abbreviate(err));
                     })
                     .body(JsonNode.class);
         } catch (ResourceAccessException e) {        // таймаут/обрыв/DNS — не отвечает
             llm.failure();
+            metrics.llmRequestError("network_error");                               // +++
             // Таймаут LLM — ТРАНЗИТНЫЙ сбой, не сбой задачи.
             // Обёртка включает и ретрай-цикл extractHeader, и requeue сервиса
-            throw new ImanUnavailableException(                                    // +++
-                    "LLM: таймаут/сеть — " + abbreviate(e.getMessage(), 160), e);   // +++
+            throw new ImanUnavailableException(
+                    "LLM: таймаут/сеть — " + abbreviate(e.getMessage(), 160), e);
         }
     }
 
@@ -270,6 +291,7 @@ public class ImanDocumentEnricher {
             // токен мог протухнуть — обновляем и повторяем запрос
             // Прошёл refresh — транзитный сбой, пауза не нужна
             if (tokens.refreshIfStale(token)) {
+                metrics.llmRequestError("token_refresh");                           // +++
                 throw new ImanUnavailableException("LLM HTTP " + code
                         + ": access_token обновлён, повторяем с новым");
             }
@@ -415,7 +437,7 @@ public class ImanDocumentEnricher {
                 .replace("\\r", "")
                 .replace("\\\"", "\"");
         s = s.replaceAll("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\uFFFD\\u200B-\\u200D\\uFEFF]", "");
-        // +++ экранируем «голые» амперсанды (уже корректные сущности вида &amp;/&#160; не трогаем)
+        // экранируем «голые» амперсанды (уже корректные сущности вида &amp;/&#160; не трогаем)
         s = BARE_AMP.matcher(s).replaceAll("&amp;");
         return s.trim();
     }
@@ -432,9 +454,9 @@ public class ImanDocumentEnricher {
 
     /** Кандидаты починки: метка → вариант; порядок = приоритет применения. */
     private Map<String, String> repairCandidates(String xml) {
-        String cleaned = sanitize(xml);          // +++ теперь ещё и экранирует «голые» &
+        String cleaned = sanitize(xml);
         Map<String, String> fixes = new LinkedHashMap<>();
-        fixes.put("очистка хвоста, эскейпов и &", cleaned);                   // +++
+        fixes.put("очистка хвоста, эскейпов и &", cleaned);
         fixes.put("досбор тегов", tryRepair(xml));
         // очистка уже не изменила ничего — комбо дублировало бы чистый досбор
         fixes.put("очистка + досбор", cleaned.equals(xml) ? null : tryRepair(cleaned));
@@ -452,6 +474,7 @@ public class ImanDocumentEnricher {
             String defect = abbreviate(cause.getMessage(), 120);
             String appliedFix = en.getKey();
             log.warn("LLM: XML с дефектом ({}), исправлен ({})", defect, appliedFix);
+            metrics.llmXmlRepair();                                       // +++
             return candidate;
         }
         String tail = xml.substring(Math.max(0, xml.length() - 200));
@@ -495,7 +518,7 @@ public class ImanDocumentEnricher {
 
     /** Обрезанные и заблокированные ответы — ошибка; нестандартные — предупреждение. */
     private void checkFinishReason(String finishReason) {
-        // +++ обрезка по лимиту детерминирована (reasoning-токены при том же входе повторятся)
+        // обрезка по лимиту детерминирована (reasoning-токены при том же входе повторятся)
         if ("length".equals(finishReason)) {
             throw new LlmBadOutputException(
                     "LLM: ответ обрезан по max_tokens=" + props.maxTokens()
@@ -541,7 +564,7 @@ public class ImanDocumentEnricher {
         int start = cleaned.indexOf(DOC_OPEN);
         int end = cleaned.lastIndexOf(DOC_CLOSE);
         if (start < 0 || end < start) {
-            // +++ при temperature 0.1 модель повторит тот же мусор — повтор бессмыслен
+            // при temperature 0.1 модель повторит тот же мусор — повтор бессмыслен
             throw new LlmBadOutputException(
                     "LLM: нет <Document>...</Document> в ответе: " + abbreviate(cleaned));
         }
@@ -552,7 +575,7 @@ public class ImanDocumentEnricher {
         try {
             dbf.newDocumentBuilder().parse(new InputSource(new StringReader(xml)));
         } catch (Exception e) {
-            // +++ битый XML после провала автопочинки — неисправим, не транзитный сбой
+            // битый XML после провала автопочинки — неисправим, не транзитный сбой
             throw new LlmBadOutputException("LLM: невалидный XML — " + e.getMessage());
         }
     }

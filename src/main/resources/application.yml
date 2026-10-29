@@ -1,3 +1,5 @@
+server:
+  port: -1
 spring:
   lifecycle:
     timeout-per-shutdown-phase: 80s
@@ -25,11 +27,11 @@ app:
   stale-timeout-sec: 3600        # "зависшая" PROCESSING-задача считается потерянной -900
   max-retries: 2                # максимум повторов ERROR-задачи
   retry-delay-sec: 60           # пауза перед повтором ошибочной задачи
-  ocr-max-mb: 6                 # максимальный размер файла для парсинга (5Mb)
+  ocr-max-mb: 12                 # максимальный размер файла для парсинга (5Mb)
   ocr-poison-retries: 3         # документ-специфичный отказ OCR (есть)
   zombie-transient-retries: 10  # подряд транзитных сбоев ЛЮБОГО рода → REJECTED
   prompt : |
-    Ты получаешь текст документа. Выполни шаги : 1. Выбери из текста названия всех юр. лиц (организация-автор и контрагенты), их ИНН и КПП, если присутствуют. 2. Определи Вид документа (классификация, принятая в системах ЭДО). 3. Заполни XML-структуру по шаблону ниже данными из текста; заполни все теги, если данных нет — оставь тег пустым. 4. Выведи мне ТОЛЬКО XML без стороннего текста и без markdown. Шаблон:<Document><Header><DocumentType></DocumentType><RelatedDocument></RelatedDocument><Date></Date><Number></Number><OrderDate></OrderDate><OrderNumber></OrderNumber><CopyNumber></CopyNumber><Summa></Summa><NDS></NDS><Currency></Currency></Header><Parties><Company><Country></Country><Name></Name><Role></Role><Address></Address><INN></INN><Phone></Phone><SignatoryCompany></SignatoryCompany></Company><Counterparties><Counterparty><Country></Country><Name></Name><Address></Address><INN></INN><Phones><Phone></Phone></Phones><SignatoryCounterparty></SignatoryCounterparty></Counterparty></Counterparties></Parties></Document> Имена тегов выводи с точным соблюдением регистра. Дату заказа выводи строго как <OrderDate>ДД.ММ.ГГГГ</OrderDate>, без атрибутов. Текст документа:
+    Ты получаешь текст документа. Выполни шаги: 1. Выбери из текста названия всех юр. лиц (организация-автор и контрагенты), их ИНН и КПП, если присутствуют. 2. Определи Вид документа (классификация, принятая в системах ЭДО) и нормализуй его название. Если в документе вид указан под любым названием из левого списка, в тег <DocumentType> выведи строго соответствующее значение из правого списка: «ТТН», «товарно-транспортная накладная», «транспортная накладная», «товарная накладная» → ТТН; «СФ», «счёт-фактура» → Счет-фактура Правила нормализации: - значение в <DocumentType> выводи без кавычек, номеров форм (например, «1-Т») и дополнительных слов; - для одного и того же вида документа всегда используй одно и то же написание; - если вид документа не входит в список соответствий, выведи его общепринятое краткое название (например: «Счет-фактура», «УПД», «Акт», «Счет на оплату», «Дополнительное соглашение», «Договор»); - если вид документа невозможно определить из текста — проставь тег <DocumentType> = «Иное». 3. Заполни XML-структуру по шаблону ниже данными из текста; заполни все теги, если данных нет — оставь тег пустым. 4. Выведи мне ТОЛЬКО XML без стороннего текста и без markdown. Шаблон:<Document><Header><DocumentType></DocumentType><RelatedDocument></RelatedDocument><Date></Date><Number></Number><OrderDate></OrderDate><OrderNumber></OrderNumber><CopyNumber></CopyNumber><Summa></Summa><NDS></NDS><Currency></Currency></Header><Parties><Company><Country></Country><Name></Name><Role></Role><Address></Address><INN></INN><Phone></Phone><SignatoryCompany></SignatoryCompany></Company><Counterparties><Counterparty><Country></Country><Name></Name><Address></Address><INN></INN><Phones><Phone></Phone></Phones><SignatoryCounterparty></SignatoryCounterparty></Counterparty></Counterparties></Parties></Document> Имена тегов выводи с точным соблюдением регистра. Дату заказа выводи строго как <OrderDate>ДД.ММ.ГГГГ</OrderDate>, без атрибутов. Текст документа:
   exec:
     light:
       core: 20                  # лёгкий пул (обычные файлы) default - 30
@@ -48,7 +50,7 @@ iman:
   refresh-token: ${IMAN_REFRESH_TOKEN:}    # долговременный ключ — только в env
   refresh-url: ${IMAN_REFRESH_URL:https://iman.ai.loodsen.ru/auth/refresh}
   temperature: 0.1
-  max-tokens: 10000
+  max-tokens: 20000
   max-concurrent: 6 # было 8
   slot-wait-ms: 120000
   slow-response-ms: 60000
@@ -92,3 +94,19 @@ ocr:
   # url: http://doc-app8:4842/CDvService/86d8e4719c0cf1119f353a68ddb4ef9b/ToolsPage/ReadFile
   # max-attempts: 2
   # retry-backoff: 10s
+management:
+  server:
+    port: 9091
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  metrics:
+    distribution:
+      percentiles-histogram:
+        docx_task_duration_seconds: true
+        docx_llm_duration_seconds: true
+        docx_ocr_duration_seconds: true
+    tags:
+      application: docx-to-xml-service   # общая метка на все серии (мультиинстансность)
+# app.metrics-queue-interval-ms: 15000  # период обновления gauge-метрик очереди (дефолт 15 с)

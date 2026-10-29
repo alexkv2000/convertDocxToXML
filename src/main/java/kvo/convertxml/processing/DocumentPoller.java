@@ -2,6 +2,7 @@ package kvo.convertxml.processing;
 
 import kvo.convertxml.client.ImanDocumentEnricher;
 import kvo.convertxml.client.LlmAvailability;
+import kvo.convertxml.metrics.ServiceMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -31,6 +32,8 @@ public class DocumentPoller {
     private final ImanDocumentEnricher enricher;
     private final InstanceId instanceId;
     private final ThreadPoolTaskExecutor workers;
+    private final ServiceMetrics metrics;                  // +++
+    private final int maxWorkers;                          // +++
     private final int batchSize;
     private final int staleTimeoutSec;
     private final int maxRetries;
@@ -53,7 +56,8 @@ public class DocumentPoller {
                           @Value("${app.max-retries:3}") int maxRetries,
                           @Value("${app.retry-delay-sec:60}") int retryDelaySec,
                           LlmAvailability llm,
-                          ImanDocumentEnricher enricher) {
+                          ImanDocumentEnricher enricher,
+                          ServiceMetrics metrics) {
         this.dao = dao;
         this.service = service;
         this.instanceId = instanceId;
@@ -64,9 +68,11 @@ public class DocumentPoller {
         this.retryDelaySec = retryDelaySec;
         // Размер семафора — из фактического максимума пула, а не из дублирующей
         // проперти app.exec.light.core (дефолт 4 при пуле на 25 → 21 поток простаивал).
-        this.inFlight = new Semaphore(Math.max(1, docWorkers.getMaxPoolSize()));
+        this.maxWorkers = Math.max(1, docWorkers.getMaxPoolSize());     // +++
+        this.inFlight = new Semaphore(maxWorkers);                      // +++
         this.llm = llm;
         this.enricher = enricher;
+        this.metrics = metrics;
     }
 
     /** Ингест: перенос новых файлов из таблиц DocsVision в очередь (только чтение источников). */
@@ -77,6 +83,7 @@ public class DocumentPoller {
             int added = dao.ingestNewTasks(ingestLookbackDays);
             long ms = System.currentTimeMillis() - t0;
             if (added > 0) {
+                metrics.ingestAdded(added);                              // +++
                 log.info("[{}] новых задач в очереди: {} за {} мс", instanceId.get(), added, ms);
             } else {
                 log.debug("[{}] ингест: 0 новых за {} мс", instanceId.get(), ms);
@@ -95,6 +102,8 @@ public class DocumentPoller {
      */
     @Scheduled(fixedDelayString = "${app.poll-interval-ms:5000}")
     public void poll() {
+        // gauge занятости воркеров обновляем ДО всех выходов (в т.ч. на паузе LLM)
+        metrics.workersInFlight(maxWorkers - inFlight.availablePermits());  // +++
         if (llm.isPaused()) {
             probeLlm();
             return;
@@ -120,6 +129,7 @@ public class DocumentPoller {
             return;
         }
         markMissingSources(claims, headers);     // пустой headers = «источники удалены», это ок
+        metrics.tasksClaimed(headers.size());    // +++
         log.info("[{}] захвачено задач: {}", instanceId.get(), headers.size());
         dispatch(headers, tokens);
     }
@@ -157,6 +167,7 @@ public class DocumentPoller {
         List<DocumentTaskDao.Claim> missing = claims.stream()
                 .filter(c -> !found.contains(c.id())).toList();
         dao.failMissing(instanceId.get(), missing);
+        metrics.taskMissing(missing.size());                                 // +++
         log.warn("Захвачено {}, заголовков {} — {} задач без исходника помечены (status=3)",
                 claims.size(), headers.size(), missing.size());
     }

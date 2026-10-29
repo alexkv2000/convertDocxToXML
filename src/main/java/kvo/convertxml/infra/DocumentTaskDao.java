@@ -54,11 +54,14 @@ public class DocumentTaskDao {
                            AND updated_at < DATEADD(SECOND, -?, SYSUTCDATETIME()))
                 ORDER BY
                     CASE WHEN status = 1 THEN 0        -- восстановление зависших — первыми
-                         WHEN status = 0 THEN 1        -- новые/перая очередь
-                         ELSE 2 END,                   -- ретраи ERROR — в последнюю очередь
-                    created_at DESC,                   -- + свежие документы вперёд:
-                                                       -- + остатки в хвост не голодает
-                                                       -- + и не забивает воркеров в пиковые часы
+                         WHEN status = 0 THEN 1        -- новые
+                         ELSE 2 END,                   -- ретраи — в последнюю очередь
+                    -- НО внутри ретраев СТАРШИЕ вперёд (FIFO): иначе хвост голодал
+                    -- вечно, пока есть приток новых (2719 задач висели 41 сутки).
+                    -- Новые/зависшие — по-прежнему свежие вперёд.
+                    CASE WHEN status = 3 THEN DATEDIFF(SECOND, '20000101', created_at)
+                         ELSE 0 END,
+                    created_at DESC,
                     id
             )
             UPDATE d

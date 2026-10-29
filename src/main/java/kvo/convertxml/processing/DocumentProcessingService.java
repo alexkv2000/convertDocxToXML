@@ -10,6 +10,7 @@ import kvo.convertxml.infra.ClaimHeartbeat;
 import kvo.convertxml.infra.DocumentTaskDao;
 import kvo.convertxml.infra.DocumentTaskDao.TaskHeader;
 import kvo.convertxml.infra.InstanceId;
+import kvo.convertxml.metrics.ServiceMetrics;
 import kvo.convertxml.parser.OcrEmptyTextException;
 import kvo.convertxml.parser.OcrSizeLimitException;
 import kvo.convertxml.parser.ParserDispatcher;
@@ -35,6 +36,7 @@ public class DocumentProcessingService {
 
     private static final Logger log = LoggerFactory.getLogger(DocumentProcessingService.class);
     private final ClaimHeartbeat heartbeat;
+    private final ServiceMetrics metrics;             // +++ метрики для Grafana
 
     /** Ограничение текста ошибки для записи в БД — защита колонки error от переполнения. */
     private static final int MAX_ERROR_LEN = 500;
@@ -100,7 +102,8 @@ public class DocumentProcessingService {
                                      @Value("${app.min-length-xml:20}") int minTextLength,
                                      ClaimHeartbeat heartbeat,
                                      @Value("${app.ocr-poison-retries:3}") int ocrPoisonRetries,
-                                     @Value("${app.zombie-transient-retries:20}") int zombieTransientRetries) {
+                                     @Value("${app.zombie-transient-retries:20}") int zombieTransientRetries,
+                                     ServiceMetrics metrics) {
         this.dao = dao;
         this.parser = parser;
         this.instanceId = instanceId;
@@ -112,6 +115,7 @@ public class DocumentProcessingService {
         this.heartbeat = heartbeat;
         this.ocrPoisonRetries = Math.max(2, ocrPoisonRetries);
         this.zombieTransientRetries = Math.max(10, zombieTransientRetries);
+        this.metrics = metrics;
     }
 
     public void process(TaskHeader row, UUID token) {
@@ -159,10 +163,12 @@ public class DocumentProcessingService {
         } catch (Exception e) {
             long totalMs = elapsed(started);
             log.error("Ошибка обработки задачи {} за {} мс", row.id(), totalMs, e);
+            metrics.taskFailed("error");                                   // +++
             // Счётчики транзитных сбоев не чистим: сбой мог случиться после
             // успешного OCR, счётчик должен дожить до следующей попытки.
             safeMarkFailed(row.id(), me, token, e);
         } finally {
+            metrics.recordTaskTotal(elapsed(started));                     // +++ p95 цикла любой попытки
             deleteTempFile(txtFile);
             heartbeat.release(row.id());          // всегда, при любом исходе
         }
@@ -173,6 +179,7 @@ public class DocumentProcessingService {
     private void rejectBadFormat(TaskHeader row, UUID token, String me,
                                  IllegalArgumentException e) {
         transientFails.remove(row.id());
+        metrics.taskRejected("bad_format");                                // +++
         boolean ok = dao.markRejected(row.id(), me, token, truncate(e.getMessage()));
         log.warn("Задача {}: неподдерживаемый/повреждённый исходник — {} "
                 + "(rejected={})", row.id(), e.getMessage(), ok);
@@ -181,6 +188,7 @@ public class DocumentProcessingService {
     private void rejectEmptyOcr(TaskHeader row, UUID token, String me,
                                 OcrEmptyTextException e) {
         transientFails.remove(row.id());
+        metrics.taskRejected("empty_ocr");                                 // +++
         boolean ok = dao.markRejected(row.id(), me, token, truncate(e.getMessage()));
         log.warn("Задача {}: {} (rejected={})", row.id(), e.getMessage(), ok);
     }
@@ -205,65 +213,65 @@ public class DocumentProcessingService {
     }
 
     /**
-     * Загрузка исходника и парсинг в текстовый temp-файл — С КЭШЕМ по задаче.   // +++
-     * <p>                                                                       // +++
-     * После успешного parse (для сканов внутри — OCR на 5–17 минут серверного   // +++
-     * времени) текст сохраняется в doc_documents.parsed_text. Повтор задачи —   // +++
-     * невалидный XML от LLM (markFailed), таймаут LLM (markTransient) — берёт   // +++
-     * текст из кэша и идёт сразу в LLM, БЕЗ повторного OCR.                     // +++
-     * <p>                                                                       // +++
-     * Кэш чистится только в терминальных исходах (DONE / пустой текст /         // +++
-     * REJECTED — см. SQL в DocumentTaskDao), поэтому таблица не распухает.      // +++
-     * <p>                                                                       // +++
-     * Байты исходника не нужны после parseToText: локальная переменная источника// +++
-     * умирает на выходе из метода, ссылка недостижима и GC освободит память     // +++
-     * ещё до вызова LLM — отдельное присваивание null не требуется.             // +++
+     * Загрузка исходника и парсинг в текстовый temp-файл — С КЭШЕМ по задаче.
+     * <p>
+     * После успешного parse (для сканов внутри — OCR на 5–17 минут серверного
+     * времени) текст сохраняется в doc_documents.parsed_text. Повтор задачи —
+     * невалидный XML от LLM (markFailed), таймаут LLM (markTransient) — берёт
+     * текст из кэша и идёт сразу в LLM, БЕЗ повторного OCR.
+     * <p>
+     * Кэш чистится только в терминальных исходах (DONE / пустой текст /
+     * REJECTED — см. SQL в DocumentTaskDao), поэтому таблица не распухает.
+     * <p>
+     * Байты исходника не нужны после parseToText: локальная переменная источника
+     * умирает на выходе из метода, ссылка недостижима и GC освободит память
+     * ещё до вызова LLM — отдельное присваивание null не требуется.
      */
     private Parsed loadAndParse(TaskHeader row) {
         long t = System.nanoTime();
-        String cached = dao.loadParsedText(row.id());                            // +++
-        if (cached != null) {                                                    // +++
-            Path fromCache = writeTempText(cached);                              // +++
-            long loadMs = elapsed(t);                                            // +++
-            log.info("Задача {}: текст из кэша ({} симв., {} мс) — "             // +++
-                    + "парсинг/OCR пропущены", row.id(), cached.length(), loadMs); // +++
-            return new Parsed(fromCache, loadMs, 0);                             // +++
-        }                                                                        // +++
+        String cached = dao.loadParsedText(row.id());
+        if (cached != null) {
+            Path fromCache = writeTempText(cached);
+            long loadMs = elapsed(t);
+            log.info("Задача {}: текст из кэша ({} симв., {} мс) — "
+                    + "парсинг/OCR пропущены", row.id(), cached.length(), loadMs);
+            return new Parsed(fromCache, loadMs, 0);
+        }
         byte[] source = dao.loadBinary(row.fileId());
         long loadMs = elapsed(t);
         t = System.nanoTime();
         Path txtFile = parser.parseToText(row.fileName(), source);
-        long parseMs = elapsed(t);                                               // +++
-        saveParsedTextQuietly(row.id(), txtFile);                                // +++
-        return new Parsed(txtFile, loadMs, parseMs);                             // +++
+        long parseMs = elapsed(t);
+        saveParsedTextQuietly(row.id(), txtFile);
+        return new Parsed(txtFile, loadMs, parseMs);
     }
 
     /**
-     * +++ Кэш → temp-файл: дальнейший конвейер (LLM) работает с файлом, как раньше.
+     * Кэш → temp-файл: дальнейший конвейер (LLM) работает с файлом, как раньше.
      */
-    private Path writeTempText(String text) {                                    // +++
-        try {                                                                    // +++
-            Path tmp = Files.createTempFile("doctext-", ".txt");                 // +++
-            Files.writeString(tmp, text, StandardCharsets.UTF_8);                // +++
-            return tmp;                                                          // +++
-        } catch (IOException e) {                                                // +++
-            throw new IllegalStateException(                                     // +++
-                    "Не удалось создать temp-файл из кэша текста", e);           // +++
-        }                                                                        // +++
-    }                                                                            // +++
+    private Path writeTempText(String text) {
+        try {
+            Path tmp = Files.createTempFile("doctext-", ".txt");
+            Files.writeString(tmp, text, StandardCharsets.UTF_8);
+            return tmp;
+        } catch (IOException e) {
+            throw new IllegalStateException(
+                    "Не удалось создать temp-файл из кэша текста", e);
+        }
+    }
 
     /**
-     * +++ Кэширование — best effort: сбой записи кэша не должен валить          // +++
-     * +++ уже сделанную работу; худший случай — повтор честно перепарсит.
-     */    // +++
-    private void saveParsedTextQuietly(long id, Path txtFile) {                  // +++
-        try {                                                                    // +++
-            dao.saveParsedText(id, Files.readString(txtFile, StandardCharsets.UTF_8)); // +++
-        } catch (Exception e) {                                                  // +++
-            log.warn("Задача {}: кэш текста не сохранён — повтор повторит "      // +++
-                    + "парсинг ({})", id, e.getMessage());                       // +++
-        }                                                                        // +++
-    }                                                                            // +++
+     * Кэширование — best effort: сбой записи кэша не должен валить
+     * уже сделанную работу; худший случай — повтор честно перепарсит.
+     */
+    private void saveParsedTextQuietly(long id, Path txtFile) {
+        try {
+            dao.saveParsedText(id, Files.readString(txtFile, StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            log.warn("Задача {}: кэш текста не сохранён — повтор повторит "
+                    + "парсинг ({})", id, e.getMessage());
+        }
+    }
 
     private boolean isTextTooShort(String text) {
         return text.isBlank() || text.length() < minTextLength;
@@ -272,6 +280,7 @@ public class DocumentProcessingService {
     private void markTooShort(TaskHeader row, UUID token, String me) {
         boolean marked = dao.markEmptyResult(row.id(), me, token);
         transientFails.remove(row.id());       // терминальный исход
+        metrics.taskEmpty();                                                   // +++
         clusterAlive();                        // OCR отработал — кластер жив
         log.warn("Задача {}: извлечённый текст пуст/короче {} симв. (marked={})",
                 row.id(), minTextLength, marked);
@@ -284,6 +293,10 @@ public class DocumentProcessingService {
         if (saved) {
             transientFails.remove(row.id());   // терминальный исход
             clusterAlive();                    // конвейер жив
+            metrics.taskDone();                                                // +++
+            metrics.recordTaskLoad(tm.loadMs());                               // +++
+            metrics.recordTaskParse(tm.parseMs());                             // +++
+            metrics.recordTaskIman(tm.imanMs());                               // +++
             log.info("Задача {} завершена: load={} мс, parse={} мс, iman={} мс, итог {} мс",
                     row.id(), tm.loadMs(), tm.parseMs(), tm.imanMs(), elapsed(tm.started()));
             warnSlowParse(row, tm.parseMs());
@@ -302,6 +315,7 @@ public class DocumentProcessingService {
     /** Файл больше лимита OCR — терминальный REJECTED без распознавания. */
     private void rejectOversized(TaskHeader row, UUID token, String me, OcrSizeLimitException e) {
         transientFails.remove(row.id());       // терминальный исход
+        metrics.taskRejected("oversized");                                     // +++
         boolean ok = dao.markRejected(row.id(), me, token, truncate(e.getMessage()));
         log.warn("Задача {}: отклонена без OCR — {} (rejected={})", row.id(), e.getMessage(), ok);
     }
@@ -316,6 +330,8 @@ public class DocumentProcessingService {
      * «OCR-poison и LLM-бад» сбрасывало бы счётчик, и задача крутилась бы вечно.
      */
     private void countFailedLlmAttempt(TaskHeader row, UUID token, String me, LlmBadOutputException e) {
+        metrics.taskFailed("llm_bad_output");                                  // +++
+        metrics.llmBadOutput();                                                // +++
         safeMarkFailed(row.id(), me, token, e);
         log.warn("Задача {}: неисправимый ответ LLM, засчитана неудачная попытка: {}",
                 row.id(), e.getMessage());
@@ -325,6 +341,7 @@ public class DocumentProcessingService {
      *  после app.max-retries задача остановится в ERROR. После починки
      *  iman.model — вернуть в очередь (status=0, retry_count=0). */
     private void countFailedLlmConfig(TaskHeader row, UUID token, String me, LlmPermanentException e) {
+        metrics.taskFailed("llm_config");                                      // +++
         safeMarkFailed(row.id(), me, token, e);
         log.error("Задача {}: ПОСТОЯННАЯ ошибка LLM — {}. Проверьте iman.model и iman.base-url",
                 row.id(), e.getMessage());
@@ -341,6 +358,7 @@ public class DocumentProcessingService {
             rejectZombieTask(row, token, me, e, f.anyCount);
             return;
         }
+        metrics.taskTransient();                                               // +++
         requeue(row.id(), token, me, backoffDelaySec(f.anyCount), e.getMessage());
     }
 
@@ -350,6 +368,7 @@ public class DocumentProcessingService {
     private void rejectPoisonDocument(TaskHeader row, UUID token, String me,
                                       RuntimeException e, int streak) {
         transientFails.remove(row.id());
+        metrics.taskRejected("poison");                                        // +++
         boolean ok = dao.markRejected(row.id(), me, token,
                 truncate("poison-документ: " + e.getMessage()));
         log.warn("Задача {}: {} подряд документ-специфичных отказов OCR — "
@@ -367,6 +386,7 @@ public class DocumentProcessingService {
     private void rejectZombieTask(TaskHeader row, UUID token, String me,
                                   RuntimeException e, int streak) {
         transientFails.remove(row.id());
+        metrics.taskRejected("zombie");                                        // +++
         boolean ok = dao.markRejected(row.id(), me, token, truncate(
                 "ZOMBIE: " + streak + " подряд транзитных сбоев, последний: " + e.getMessage()));
         log.warn("Задача {}: ЗОМБИ — {} подряд транзитных сбоев → REJECTED (rejected={}): {}",

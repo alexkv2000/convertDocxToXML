@@ -1,5 +1,6 @@
 package kvo.convertxml.client;
 
+import kvo.convertxml.metrics.ServiceMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -9,6 +10,8 @@ import java.time.Duration;
 /**
  * «Предохранитель» доступности LLM: после серии подряд сетевых сбоев
  * приостанавливает опрос БД, пока LLM не ответит на проверочный запрос.
+ * Состояние предохранителя экспортируется в Grafana: docx_llm_paused,
+ * docx_llm_consecutive_failures.
  */
 @Component
 public class LlmAvailability {
@@ -20,9 +23,15 @@ public class LlmAvailability {
     /** как часто отправлять пробу во время простоя */
     private static final Duration PROBE_EVERY = Duration.ofSeconds(60);
 
+    private final ServiceMetrics metrics;
+
     private int consecutiveFailures;
     private long pausedUntil;   // epoch millis; 0 = паузы нет
     private long nextProbeAt;
+
+    public LlmAvailability(ServiceMetrics metrics) {
+        this.metrics = metrics;
+    }
 
     /** true — LLM считается недоступным, опрос БД приостановлен */
     public synchronized boolean isPaused() {
@@ -42,16 +51,20 @@ public class LlmAvailability {
         consecutiveFailures = 0;
         pausedUntil = 0;
         nextProbeAt = 0;
+        metrics.llmPaused(false);
+        metrics.llmConsecutiveFailures(0);
         if (wasPaused) log.info("LLM ответил: возобновляем опрос и обработку задач");
     }
 
     public synchronized void failure() {
         consecutiveFailures++;
+        metrics.llmConsecutiveFailures(consecutiveFailures);
         if (consecutiveFailures >= FAILURES_TO_PAUSE) {
             long now = System.currentTimeMillis();
             if (pausedUntil == 0) {
                 log.warn("LLM недоступен ({} сетевых сбоев подряд): приостанавливаем опрос БД, проба каждые {} c",
                         consecutiveFailures, PROBE_EVERY.toSeconds());
+                metrics.llmPaused(true);
             }
             pausedUntil = now + PROBE_EVERY.toMillis();
         }
